@@ -1,7 +1,7 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from app.models.schemas import RestartJobRequest, RestreamStartRequest
+from app.models.schemas import RestartJobRequest, RestreamStartRequest, S3DownloadRequest
 from app.services.restream_service import *
 
 
@@ -69,6 +69,16 @@ def scan_videos():
         deduplicated = merge_duplicate_video_records()
         pruned = prune_missing_videos()
     return {"imported": imported, "deduplicated": deduplicated, "pruned": pruned}
+
+
+@router.get("/api/downloads")
+def get_downloads():
+    return list_downloads()
+
+
+@router.post("/api/downloads")
+def download_from_s3(request: S3DownloadRequest):
+    return start_s3_download(request.source)
 
 
 @router.post("/api/jobs")

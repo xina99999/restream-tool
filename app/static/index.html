@@ -38,6 +38,11 @@
             </label>
             <button id="scanVideos" class="secondary" type="button">Scan Existing</button>
           </div>
+          <div class="s3-download-actions">
+            <input id="s3DownloadSource" placeholder="s3://bucket/video.mp4 or public HTTPS URL" />
+            <button id="startS3Download" class="secondary" type="button">Download S3</button>
+          </div>
+          <div id="downloadList" class="download-list" hidden></div>
           <div class="video-tools">
             <input id="videoSearch" placeholder="Search video name..." />
             <select id="videoSort">

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, UploadFile
 
@@ -70,6 +71,7 @@ runtime_processes: dict[str, RuntimeProcess] = {}
 runtime_lock = threading.Lock()
 job_action_lock = threading.Lock()
 video_registry_lock = threading.Lock()
+download_lock = threading.Lock()
 shutdown_event = threading.Event()
 
 
@@ -194,6 +196,32 @@ def init_storage() -> None:
                 status TEXT
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS downloads (
+                id TEXT PRIMARY KEY,
+                source_url TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                total_bytes INTEGER,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                video_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC)")
+        conn.execute(
+            """
+            UPDATE downloads
+            SET status = 'FAILED', error = 'Container restarted before download finished', updated_at = ?
+            WHERE status IN ('PENDING', 'DOWNLOADING', 'PROCESSING')
+            """,
+            (utc_now(),),
         )
 
 
@@ -644,6 +672,127 @@ def source_display_name(source: str) -> str:
     parsed = urlparse(source)
     name = Path(parsed.path).name
     return name or "S3 video"
+
+
+def download_row_to_dict(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item.pop("source_url", None)
+    return item
+
+
+def get_download(download_id: str) -> Optional[dict]:
+    row = db_fetchone("SELECT * FROM downloads WHERE id = ?", (download_id,))
+    return download_row_to_dict(row) if row else None
+
+
+def list_downloads() -> list[dict]:
+    rows = db_fetchall("SELECT * FROM downloads ORDER BY created_at DESC LIMIT 50")
+    return [download_row_to_dict(row) for row in rows]
+
+
+def update_download(download_id: str, **changes: object) -> None:
+    if not changes:
+        return
+    changes["updated_at"] = utc_now()
+    fields = ", ".join(f"{key} = ?" for key in changes)
+    db_execute(
+        f"UPDATE downloads SET {fields} WHERE id = ?",
+        (*changes.values(), download_id),
+    )
+
+
+def download_source_to_library(download_id: str, source_url: str, original_name: str) -> None:
+    target_path = UPLOAD_DIR / f"{download_id}_{original_name}"
+    partial_path = target_path.with_suffix(target_path.suffix + ".part")
+    try:
+        resolved_url = resolve_s3_source(source_url)
+        request = Request(resolved_url, headers={"User-Agent": "RTSP-Restream-Tool/1.0"})
+        update_download(download_id, status="DOWNLOADING")
+        with urlopen(request, timeout=30) as response, partial_path.open("wb") as output:
+            total_header = response.headers.get("Content-Length")
+            try:
+                total_bytes = int(total_header) if total_header else None
+            except ValueError:
+                total_bytes = None
+            update_download(download_id, total_bytes=total_bytes, downloaded_bytes=0)
+            downloaded_bytes = 0
+            last_reported_at = 0.0
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                downloaded_bytes += len(chunk)
+                now = time.monotonic()
+                if now - last_reported_at >= 0.5:
+                    update_download(download_id, downloaded_bytes=downloaded_bytes)
+                    last_reported_at = now
+        update_download(download_id, status="PROCESSING", downloaded_bytes=downloaded_bytes)
+        partial_path.replace(target_path)
+        duration = get_duration_seconds(target_path)
+        content_hash = file_content_hash(target_path)
+        with video_registry_lock:
+            duplicate = db_fetchone("SELECT * FROM videos WHERE content_hash = ?", (content_hash,))
+            if duplicate:
+                target_path.unlink(missing_ok=True)
+                update_download(
+                    download_id,
+                    status="COMPLETED",
+                    video_id=duplicate["id"],
+                    completed_at=utc_now(),
+                    downloaded_bytes=downloaded_bytes,
+                )
+                return
+            video_id = str(uuid.uuid4())
+            db_execute(
+                """
+                INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, content_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (video_id, original_name, str(target_path), downloaded_bytes, duration, content_hash, utc_now()),
+            )
+        update_download(
+            download_id,
+            status="COMPLETED",
+            video_id=video_id,
+            completed_at=utc_now(),
+            downloaded_bytes=downloaded_bytes,
+        )
+    except Exception as error:
+        partial_path.unlink(missing_ok=True)
+        update_download(download_id, status="FAILED", error=str(error)[-1000:])
+
+
+def start_s3_download(source: str) -> dict:
+    source_url = source.strip()
+    if not source_url:
+        raise HTTPException(status_code=400, detail="S3 source is required")
+    if not is_remote_source(source_url) and not source_url.startswith("s3://"):
+        raise HTTPException(status_code=400, detail="S3 source must be s3://bucket/key or an HTTPS URL")
+    with download_lock:
+        existing = db_fetchone(
+            """
+            SELECT * FROM downloads
+            WHERE source_url = ? AND status IN ('PENDING', 'DOWNLOADING', 'PROCESSING')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (source_url,),
+        )
+        if existing:
+            return download_row_to_dict(existing)
+        download_id = str(uuid.uuid4())
+        original_name = source_display_name(source_url)
+        now = utc_now()
+        db_execute(
+            """
+            INSERT INTO downloads(id, source_url, original_name, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'PENDING', ?, ?)
+            """,
+            (download_id, source_url, original_name, now, now),
+        )
+        threading.Thread(
+            target=download_source_to_library,
+            args=(download_id, source_url, original_name),
+            daemon=True,
+        ).start()
+    return get_download(download_id) or {"id": download_id, "status": "PENDING"}
 
 
 def capture_job_frame(job_id: str) -> Path:

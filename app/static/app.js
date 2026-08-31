@@ -5,6 +5,8 @@ const state = {
   frameJob: null,
   frameTimer: null,
   videos: [],
+  downloads: [],
+  completedDownloadIds: new Set(),
   uploading: false,
   showRawLogs: false,
   refreshTimer: null,
@@ -142,6 +144,42 @@ function renderVideos() {
     list.appendChild(button);
   }
   renderSelectedVideo();
+}
+
+function downloadStatus(download) {
+  const downloaded = Number(download.downloaded_bytes || 0);
+  const total = Number(download.total_bytes || 0);
+  if (download.status === "DOWNLOADING") {
+    const percent = total > 0 ? ` ${Math.min(100, (downloaded / total) * 100).toFixed(1)}%` : "";
+    return `${formatSize(downloaded)}${total > 0 ? ` / ${formatSize(total)}` : ""}${percent}`;
+  }
+  if (download.status === "FAILED") return download.error || "Download failed";
+  if (download.status === "COMPLETED") return `${formatSize(downloaded)} ready`;
+  return download.status === "PROCESSING" ? "Scanning video metadata..." : "Waiting to start...";
+}
+
+function renderDownloads() {
+  const list = $("downloadList");
+  const downloads = state.downloads.filter((item) => ["PENDING", "DOWNLOADING", "PROCESSING", "FAILED"].includes(item.status));
+  list.hidden = downloads.length === 0;
+  list.innerHTML = downloads.map((download) => `
+    <div class="download-row">
+      <span class="download-name">${escapeHtml(download.original_name)}</span>
+      <span class="download-status">${escapeHtml(downloadStatus(download))}</span>
+    </div>
+  `).join("");
+}
+
+async function loadDownloads() {
+  state.downloads = await api("/api/downloads");
+  const hasNewCompleted = state.downloads
+    .filter((download) => download.status === "COMPLETED")
+    .some((download) => !state.completedDownloadIds.has(download.id));
+  state.downloads
+    .filter((download) => download.status === "COMPLETED")
+    .forEach((download) => state.completedDownloadIds.add(download.id));
+  renderDownloads();
+  return hasNewCompleted;
 }
 
 async function loadConfig() {
@@ -463,6 +501,30 @@ $("scanVideos").addEventListener("click", async () => {
   }
 });
 
+$("startS3Download").addEventListener("click", async () => {
+  const source = $("s3DownloadSource").value.trim();
+  if (!source) {
+    notify("Enter an S3 URI or public HTTPS URL.", "error");
+    return;
+  }
+  const button = $("startS3Download");
+  button.disabled = true;
+  try {
+    const download = await api("/api/downloads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    $("s3DownloadSource").value = "";
+    notify(download.status === "PENDING" ? "S3 download started." : "S3 download is already running.", "success");
+    await loadDownloads();
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("videoSearch").addEventListener("input", renderVideos);
 $("videoSort").addEventListener("change", renderVideos);
 $("encodingProfile").addEventListener("change", syncEncodingProfile);
@@ -601,7 +663,10 @@ $("jobsBody").addEventListener("click", async (event) => {
 
 async function refreshJobsSafely() {
   try {
-    await loadJobs();
+    const [, hasNewCompleted] = await Promise.all([loadJobs(), loadDownloads()]);
+    if (hasNewCompleted) {
+      await loadVideos();
+    }
   } catch (error) {
     notify("Connection to the tool was interrupted. Retrying...", "error");
   }
@@ -672,6 +737,7 @@ async function boot() {
   try {
     await loadConfig();
     await loadVideos();
+    await loadDownloads();
     await loadJobs();
     if (!state.refreshTimer) {
       state.refreshTimer = setInterval(refreshJobsSafely, 2500);

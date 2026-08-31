@@ -29,3 +29,7 @@ class RestreamStartRequest(BaseModel):
 
 class RestartJobRequest(BaseModel):
     start_offset_seconds: float = Field(default=0, ge=0)
+
+
+class S3DownloadRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=4096)

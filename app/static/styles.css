@@ -259,6 +259,50 @@ button.compact {
   gap: 10px;
 }
 
+.s3-download-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.download-list {
+  display: grid;
+  gap: 6px;
+}
+
+.download-list[hidden] {
+  display: none;
+}
+
+.download-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.download-name,
+.download-status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-name {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.download-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .video-tools {
   grid-template-columns: minmax(0, 1fr) 180px;
 }
