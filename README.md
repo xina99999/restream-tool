@@ -70,7 +70,7 @@ or an HTTPS presigned URL. For `s3://` sources, set `AWS_DEFAULT_REGION`, `AWS_A
 
 The tool reads the remote video directly with FFmpeg; it does not download a full local copy first. Resume, Run Again, auto-retry, frame capture, and container-start recovery re-create the temporary URL for an `s3://` source. A presigned HTTPS URL must remain valid for the whole restream session.
 
-To keep a local reusable copy, paste the same source into **Download S3** in the Video panel. The download runs in the background, reports downloaded bytes in the UI, scans duration after completion, and adds the resulting file to the video library. Public S3 HTTPS URLs require no AWS credentials.
+To keep a local reusable copy, paste the same source into **Download S3** in the Video panel. The dedicated `restream-download-worker` service owns the download queue, reports downloaded bytes in the UI, resumes partial files after a worker/Docker restart, scans duration after completion, and adds the resulting file to the video library. Public S3 HTTPS URLs require no AWS credentials.
 
 ## Retry behavior
 

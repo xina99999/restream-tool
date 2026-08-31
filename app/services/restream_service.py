@@ -799,20 +799,7 @@ def start_s3_download(source: str) -> dict:
             """,
             (download_id, source_url, original_name, now, now),
         )
-        threading.Thread(
-            target=download_source_to_library,
-            args=(download_id, source_url, original_name),
-            daemon=True,
-        ).start()
     return get_download(download_id) or {"id": download_id, "status": "PENDING"}
-
-
-def start_download_thread(download_id: str, source_url: str, original_name: str) -> None:
-    threading.Thread(
-        target=download_source_to_library,
-        args=(download_id, source_url, original_name),
-        daemon=True,
-    ).start()
 
 
 def resume_download(download_id: str) -> dict:
@@ -825,21 +812,45 @@ def resume_download(download_id: str) -> dict:
         if row["status"] in {"PENDING", "DOWNLOADING", "PROCESSING"}:
             return download_row_to_dict(row)
         update_download(download_id, status="PENDING", error=None)
-        start_download_thread(download_id, row["source_url"], row["original_name"])
     return get_download(download_id) or {"id": download_id, "status": "PENDING"}
 
 
-def resume_active_downloads() -> None:
-    rows = db_fetchall(
+def recover_download_queue() -> None:
+    db_execute(
         """
-        SELECT * FROM downloads
-        WHERE status IN ('PENDING', 'DOWNLOADING', 'PROCESSING')
-        ORDER BY created_at ASC
-        """
+        UPDATE downloads
+        SET status = 'PENDING', error = NULL, updated_at = ?
+        WHERE status IN ('DOWNLOADING', 'PROCESSING')
+           OR (status = 'FAILED' AND error = 'Container restarted before download finished')
+        """,
+        (utc_now(),),
     )
-    for row in rows:
-        update_download(row["id"], status="PENDING", error=None)
-        start_download_thread(row["id"], row["source_url"], row["original_name"])
+
+
+def claim_next_download() -> Optional[sqlite3.Row]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM downloads WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        updated = conn.execute(
+            "UPDATE downloads SET status = 'DOWNLOADING', error = NULL, updated_at = ? WHERE id = ? AND status = 'PENDING'",
+            (utc_now(), row["id"]),
+        )
+        return row if updated.rowcount == 1 else None
+
+
+def run_download_worker(poll_seconds: float = 2.0) -> None:
+    init_storage()
+    recover_download_queue()
+    while True:
+        download = claim_next_download()
+        if not download:
+            time.sleep(poll_seconds)
+            continue
+        download_source_to_library(download["id"], download["source_url"], download["original_name"])
 
 
 def capture_job_frame(job_id: str) -> Path:
@@ -1266,7 +1277,6 @@ async def lifespan(_: FastAPI):
     shutdown_event.clear()
     init_storage()
     scan_video_libraries()
-    resume_active_downloads()
     resume_active_jobs()
     yield
     shutdown_event.set()

@@ -38,5 +38,24 @@ services:
       # Change this host path to your existing video folder.
       - ${RESTREAM_VIDEO_LIBRARY_DIR:-./videos}:/library/videos:ro
 
+  restream-download-worker:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: public.ecr.aws/docker/library/python:3.12-slim
+    container_name: restream-download-worker
+    command: ["python", "-m", "app.download_worker"]
+    restart: unless-stopped
+    environment:
+      RESTREAM_DATA_DIR: /data
+      RESTREAM_UPLOAD_DIR: /data/videos
+      RESTREAM_DB_PATH: /data/restream.db
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes:
+      - restream-data:/data
+
 volumes:
   restream-data:
