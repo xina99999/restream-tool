@@ -1,0 +1,11 @@
+.DS_Store
+.env
+videos/
+data/
+frames/
+*.db
+*.db-shm
+*.db-wal
+*.log
+__pycache__/
+*.py[cod]

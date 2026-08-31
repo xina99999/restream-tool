@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RTSP Restream Tool</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>RTSP Restream Tool</h1>
+          <p>Upload a video, publish it to MediaMTX, and track ffmpeg progress.</p>
+        </div>
+        <button id="refreshJobs" type="button">Refresh</button>
+      </header>
+
+      <section class="grid">
+        <section id="videoPanel" class="panel video-panel">
+          <div class="section-head">
+            <h2>Video</h2>
+            <div class="head-actions">
+              <span id="videoCount">0 videos</span>
+              <button class="secondary compact" data-toggle-panel="videoPanel" type="button">Collapse</button>
+            </div>
+          </div>
+          <div class="collapsible-content">
+          <div class="upload-actions">
+            <label class="file-action">
+              Upload Files
+              <input id="videoFiles" type="file" accept="video/*,.mkv,.avi,.ts,.mp4,.mov" multiple />
+            </label>
+            <label class="file-action">
+              Upload Folder
+              <input id="videoFolder" type="file" webkitdirectory directory multiple />
+            </label>
+            <button id="scanVideos" class="secondary" type="button">Scan Existing</button>
+          </div>
+          <div class="video-tools">
+            <input id="videoSearch" placeholder="Search video name..." />
+            <select id="videoSort">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="name">Name A-Z</option>
+              <option value="duration">Longest first</option>
+            </select>
+          </div>
+          <div id="selectedVideo" class="selected-video">No video selected</div>
+          <div id="uploadProgress" class="upload-progress" hidden>
+            <div class="upload-progress-head">
+              <span id="uploadProgressText">Uploading...</span>
+              <span id="uploadProgressPercent">0%</span>
+            </div>
+            <div class="progress upload-progress-bar"><span id="uploadProgressFill"></span></div>
+          </div>
+          <div id="videoList" class="video-list"></div>
+          </div>
+        </section>
+
+        <form id="jobForm" class="panel restream-panel">
+          <div class="section-head">
+            <h2>Restream</h2>
+            <button class="secondary compact" data-toggle-panel="jobForm" type="button">Collapse</button>
+          </div>
+          <div class="collapsible-content">
+          <label>
+            Camera name
+            <input id="cameraName" placeholder="Linfox DCBN 192.168.10.31" />
+          </label>
+          <label>
+            RTSP path
+            <input id="rtspPath" required placeholder="test1_linfox_DCVSIP-192_168_253_8" />
+          </label>
+          <label>
+            Stream profile
+            <select id="encodingProfile">
+              <option value="copy">Copy original (no re-encode)</option>
+              <option value="h264_low_latency">H.264 low latency (loop, no audio)</option>
+            </select>
+          </label>
+          <div id="h264Config" class="encoding-config" hidden>
+            <div class="encoding-config-head">
+              <strong>H.264 encoding</strong>
+              <span>libx264, zerolatency, yuv420p, no audio</span>
+            </div>
+            <div class="three">
+              <label>
+                CRF
+                <input id="h264Crf" type="number" min="0" max="51" value="23" />
+              </label>
+              <label>
+                Preset
+                <select id="h264Preset">
+                  <option value="ultrafast">ultrafast</option>
+                  <option value="superfast">superfast</option>
+                  <option value="veryfast" selected>veryfast</option>
+                  <option value="faster">faster</option>
+                  <option value="fast">fast</option>
+                  <option value="medium">medium</option>
+                  <option value="slow">slow</option>
+                </select>
+              </label>
+              <label>
+                GOP
+                <input id="h264Gop" type="number" min="1" max="1000" value="30" />
+              </label>
+            </div>
+            <div class="encoding-note">Uses -g, -keyint_min, and x264 keyint/min-keyint with the same GOP value.</div>
+          </div>
+          <div class="two">
+            <label>
+              Username
+              <input id="username" />
+            </label>
+            <label>
+              Password
+              <input id="password" type="password" />
+            </label>
+          </div>
+          <div class="two">
+            <label>
+              Publish host
+              <input id="publishHost" />
+            </label>
+            <label>
+              Publish port
+              <input id="publishPort" type="number" min="1" max="65535" />
+            </label>
+          </div>
+          <div class="two">
+            <label>
+              View host
+              <input id="viewHost" />
+            </label>
+            <label>
+              View port
+              <input id="viewPort" type="number" min="1" max="65535" />
+            </label>
+          </div>
+          <label class="check">
+            <input id="loop" type="checkbox" />
+            Loop video
+          </label>
+          <label class="check">
+            <input id="autoRetry" type="checkbox" checked />
+            Auto resume until complete
+          </label>
+          <button id="startRestream" type="submit">Start Restream</button>
+          <div id="formStatus" class="form-status" aria-live="polite"></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Restream Jobs</h2>
+          <span id="activeJob"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <colgroup>
+              <col class="status-col" />
+              <col class="progress-col" />
+              <col class="camera-col" />
+              <col class="rtsp-col" />
+              <col class="action-col" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Camera</th>
+                <th>RTSP</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="jobsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <h2>Logs</h2>
+          <div class="head-actions">
+            <span id="logTitle"></span>
+            <button id="toggleRawLogs" class="secondary compact" type="button">Show Raw</button>
+          </div>
+        </div>
+        <pre id="logs"></pre>
+      </section>
+
+      <dialog id="rtspDialog" class="rtsp-dialog">
+        <div class="dialog-head">
+          <h2>RTSP View URL</h2>
+          <button id="closeRtspDialog" class="secondary compact" type="button">Close</button>
+        </div>
+        <textarea id="rtspDialogUrl" readonly></textarea>
+        <button id="copyDialogUrl" type="button">Copy URL</button>
+      </dialog>
+
+      <dialog id="jobDetailDialog" class="detail-dialog">
+        <div class="dialog-head">
+          <h2>Job Details</h2>
+          <button id="closeJobDetailDialog" class="secondary compact" type="button">Close</button>
+        </div>
+        <div id="jobDetailBody" class="detail-grid"></div>
+        <h2>Recent Logs</h2>
+        <pre id="jobDetailLogs"></pre>
+      </dialog>
+
+      <dialog id="eventDialog" class="event-dialog">
+        <div class="dialog-head">
+          <h2>Event Logs</h2>
+          <button id="closeEventDialog" class="secondary compact" type="button">Close</button>
+        </div>
+        <div id="eventList" class="event-list"></div>
+      </dialog>
+
+      <dialog id="frameDialog" class="frame-dialog">
+        <div class="dialog-head">
+          <h2>Current Frame</h2>
+          <button id="closeFrameDialog" class="secondary compact" type="button">Close</button>
+        </div>
+        <div id="frameJobName" class="selected-video">No job selected</div>
+        <div class="frame-preview">
+          <img id="frameImage" alt="Current restream frame" />
+        </div>
+        <div class="frame-actions">
+          <label class="check">
+            <input id="autoRefreshFrame" type="checkbox" checked />
+            Auto refresh
+          </label>
+          <button id="refreshFrame" class="secondary" type="button">Refresh Frame</button>
+        </div>
+        <div id="frameStatus" class="frame-status"></div>
+      </dialog>
+
+      <dialog id="restartDialog" class="restart-dialog">
+        <div class="dialog-head">
+          <h2>Run Again</h2>
+          <button id="closeRestartDialog" class="secondary compact" type="button">Close</button>
+        </div>
+        <div class="restart-body">
+          <div id="restartVideoName" class="selected-video">No job selected</div>
+          <label>
+            Start time
+            <input id="restartOffsetSlider" type="range" min="0" max="0" value="0" step="1" />
+          </label>
+          <div class="restart-time-row">
+            <input id="restartOffsetInput" type="number" min="0" value="0" step="1" />
+            <span id="restartOffsetLabel">00:00:00 / unknown</span>
+          </div>
+          <div class="restart-actions">
+            <button id="restartFromStart" class="secondary" type="button">From Start</button>
+            <button id="restartFromCurrent" class="secondary" type="button">From Current</button>
+            <button id="confirmRestart" type="button">Run Again</button>
+          </div>
+        </div>
+      </dialog>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
