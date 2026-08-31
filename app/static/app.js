@@ -354,6 +354,12 @@ async function uploadFiles(fileList) {
     state.selectedVideoId = result.items[0].id;
     renderVideos();
   }
+  setUploadProgress(100, "Upload complete.");
+  setTimeout(() => {
+    if (!state.uploading) {
+      $("uploadProgress").hidden = true;
+    }
+  }, 1800);
   notify(`Uploaded ${result.count || files.length} video(s).`, "success");
 }
 

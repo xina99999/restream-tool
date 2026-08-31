@@ -158,6 +158,10 @@ input[type="file"] {
   background: #f0fdfa;
 }
 
+.encoding-config[hidden] {
+  display: none;
+}
+
 .encoding-config-head {
   display: flex;
   justify-content: space-between;
