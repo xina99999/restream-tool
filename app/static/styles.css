@@ -292,6 +292,14 @@ button.compact {
   white-space: nowrap;
 }
 
+.download-actions {
+  display: flex;
+  align-items: center;
+  justify-content: end;
+  gap: 8px;
+  min-width: 0;
+}
+
 .download-name {
   color: var(--text);
   font-weight: 700;

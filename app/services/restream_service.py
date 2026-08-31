@@ -215,14 +215,6 @@ def init_storage() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC)")
-        conn.execute(
-            """
-            UPDATE downloads
-            SET status = 'FAILED', error = 'Container restarted before download finished', updated_at = ?
-            WHERE status IN ('PENDING', 'DOWNLOADING', 'PROCESSING')
-            """,
-            (utc_now(),),
-        )
 
 
 def is_video_file(path: Path) -> bool:
@@ -705,27 +697,48 @@ def download_source_to_library(download_id: str, source_url: str, original_name:
     target_path = UPLOAD_DIR / f"{download_id}_{original_name}"
     partial_path = target_path.with_suffix(target_path.suffix + ".part")
     try:
+        if target_path.exists():
+            update_download(download_id, status="PROCESSING", downloaded_bytes=target_path.stat().st_size)
+            finalize_downloaded_video(download_id, target_path, original_name)
+            return
         resolved_url = resolve_s3_source(source_url)
-        request = Request(resolved_url, headers={"User-Agent": "RTSP-Restream-Tool/1.0"})
+        resume_at = partial_path.stat().st_size if partial_path.exists() else 0
+        headers = {"User-Agent": "RTSP-Restream-Tool/1.0"}
+        if resume_at:
+            headers["Range"] = f"bytes={resume_at}-"
+        request = Request(resolved_url, headers=headers)
         update_download(download_id, status="DOWNLOADING")
-        with urlopen(request, timeout=30) as response, partial_path.open("wb") as output:
-            total_header = response.headers.get("Content-Length")
-            try:
-                total_bytes = int(total_header) if total_header else None
-            except ValueError:
-                total_bytes = None
-            update_download(download_id, total_bytes=total_bytes, downloaded_bytes=0)
-            downloaded_bytes = 0
-            last_reported_at = 0.0
-            while chunk := response.read(1024 * 1024):
-                output.write(chunk)
-                downloaded_bytes += len(chunk)
-                now = time.monotonic()
-                if now - last_reported_at >= 0.5:
-                    update_download(download_id, downloaded_bytes=downloaded_bytes)
-                    last_reported_at = now
+        with urlopen(request, timeout=30) as response:
+            if resume_at and getattr(response, "status", None) != 206:
+                resume_at = 0
+            mode = "ab" if resume_at else "wb"
+            with partial_path.open(mode) as output:
+                total_header = response.headers.get("Content-Length")
+                try:
+                    response_bytes = int(total_header) if total_header else None
+                except ValueError:
+                    response_bytes = None
+                total_bytes = (resume_at + response_bytes) if response_bytes is not None else None
+                update_download(download_id, total_bytes=total_bytes, downloaded_bytes=resume_at)
+                downloaded_bytes = resume_at
+                last_reported_at = 0.0
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+                    downloaded_bytes += len(chunk)
+                    now = time.monotonic()
+                    if now - last_reported_at >= 0.5:
+                        update_download(download_id, downloaded_bytes=downloaded_bytes)
+                        last_reported_at = now
         update_download(download_id, status="PROCESSING", downloaded_bytes=downloaded_bytes)
         partial_path.replace(target_path)
+        finalize_downloaded_video(download_id, target_path, original_name)
+    except Exception as error:
+        update_download(download_id, status="FAILED", error=str(error)[-1000:])
+
+
+def finalize_downloaded_video(download_id: str, target_path: Path, original_name: str) -> None:
+    try:
+        downloaded_bytes = target_path.stat().st_size
         duration = get_duration_seconds(target_path)
         content_hash = file_content_hash(target_path)
         with video_registry_lock:
@@ -756,7 +769,6 @@ def download_source_to_library(download_id: str, source_url: str, original_name:
             downloaded_bytes=downloaded_bytes,
         )
     except Exception as error:
-        partial_path.unlink(missing_ok=True)
         update_download(download_id, status="FAILED", error=str(error)[-1000:])
 
 
@@ -793,6 +805,41 @@ def start_s3_download(source: str) -> dict:
             daemon=True,
         ).start()
     return get_download(download_id) or {"id": download_id, "status": "PENDING"}
+
+
+def start_download_thread(download_id: str, source_url: str, original_name: str) -> None:
+    threading.Thread(
+        target=download_source_to_library,
+        args=(download_id, source_url, original_name),
+        daemon=True,
+    ).start()
+
+
+def resume_download(download_id: str) -> dict:
+    with download_lock:
+        row = db_fetchone("SELECT * FROM downloads WHERE id = ?", (download_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="download not found")
+        if row["status"] == "COMPLETED":
+            return download_row_to_dict(row)
+        if row["status"] in {"PENDING", "DOWNLOADING", "PROCESSING"}:
+            return download_row_to_dict(row)
+        update_download(download_id, status="PENDING", error=None)
+        start_download_thread(download_id, row["source_url"], row["original_name"])
+    return get_download(download_id) or {"id": download_id, "status": "PENDING"}
+
+
+def resume_active_downloads() -> None:
+    rows = db_fetchall(
+        """
+        SELECT * FROM downloads
+        WHERE status IN ('PENDING', 'DOWNLOADING', 'PROCESSING')
+        ORDER BY created_at ASC
+        """
+    )
+    for row in rows:
+        update_download(row["id"], status="PENDING", error=None)
+        start_download_thread(row["id"], row["source_url"], row["original_name"])
 
 
 def capture_job_frame(job_id: str) -> Path:
@@ -1219,6 +1266,7 @@ async def lifespan(_: FastAPI):
     shutdown_event.clear()
     init_storage()
     scan_video_libraries()
+    resume_active_downloads()
     resume_active_jobs()
     yield
     shutdown_event.set()

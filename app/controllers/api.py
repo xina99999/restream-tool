@@ -81,6 +81,11 @@ def download_from_s3(request: S3DownloadRequest):
     return start_s3_download(request.source)
 
 
+@router.post("/api/downloads/{download_id}/resume")
+def resume_s3_download(download_id: str):
+    return resume_download(download_id)
+
+
 @router.post("/api/jobs")
 def start_job(request: RestreamStartRequest):
     with job_action_lock:

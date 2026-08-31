@@ -165,7 +165,10 @@ function renderDownloads() {
   list.innerHTML = downloads.map((download) => `
     <div class="download-row">
       <span class="download-name">${escapeHtml(download.original_name)}</span>
-      <span class="download-status">${escapeHtml(downloadStatus(download))}</span>
+      <div class="download-actions">
+        <span class="download-status">${escapeHtml(downloadStatus(download))}</span>
+        ${download.status === "FAILED" ? `<button class="secondary compact" data-resume-download="${download.id}" type="button">Retry</button>` : ""}
+      </div>
     </div>
   `).join("");
 }
@@ -522,6 +525,18 @@ $("startS3Download").addEventListener("click", async () => {
     notify(error.message, "error");
   } finally {
     button.disabled = false;
+  }
+});
+
+$("downloadList").addEventListener("click", async (event) => {
+  const downloadId = event.target.dataset.resumeDownload;
+  if (!downloadId) return;
+  try {
+    await api(`/api/downloads/${downloadId}/resume`, { method: "POST" });
+    notify("S3 download resumed.", "success");
+    await loadDownloads();
+  } catch (error) {
+    notify(error.message, "error");
   }
 });
 
