@@ -117,6 +117,12 @@ function syncEncodingProfile() {
   }
 }
 
+function syncS3Source() {
+  const enabled = $("useS3Source").checked;
+  $("s3SourceField").hidden = !enabled;
+  $("s3Source").required = enabled;
+}
+
 function renderVideos() {
   const query = $("videoSearch").value.trim().toLowerCase();
   const filtered = state.videos.filter((video) => video.original_name.toLowerCase().includes(query));
@@ -150,6 +156,7 @@ async function loadConfig() {
   $("h264Preset").value = config.h264_defaults?.preset || "veryfast";
   $("h264Gop").value = config.h264_defaults?.gop ?? 30;
   syncEncodingProfile();
+  syncS3Source();
 }
 
 async function loadVideos() {
@@ -246,7 +253,7 @@ async function openJobDetails(jobId) {
     <div><strong>Job ID</strong><span>${escapeHtml(job.id)}</span></div>
     <div><strong>Status</strong><span>${escapeHtml(job.status)}</span></div>
     <div><strong>Video</strong><span>${escapeHtml(video.original_name || "-")}</span></div>
-    <div><strong>Video path</strong><span>${escapeHtml(video.path || "-")}</span></div>
+    <div><strong>Source</strong><span>${job.source_type === "s3" ? "S3 / remote URL" : escapeHtml(video.path || "-")}</span></div>
     <div><strong>Camera</strong><span>${escapeHtml(job.camera_name || job.camera_code || "-")}</span></div>
     <div><strong>RTSP path</strong><span>${escapeHtml(job.rtsp_path)}</span></div>
     <div><strong>Progress</strong><span>${Number(job.progress_percent || 0).toFixed(1)}%</span></div>
@@ -459,6 +466,7 @@ $("scanVideos").addEventListener("click", async () => {
 $("videoSearch").addEventListener("input", renderVideos);
 $("videoSort").addEventListener("change", renderVideos);
 $("encodingProfile").addEventListener("change", syncEncodingProfile);
+$("useS3Source").addEventListener("change", syncS3Source);
 
 $("videoList").addEventListener("click", (event) => {
   const row = event.target.closest("[data-video]");
@@ -471,12 +479,14 @@ $("jobForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const startButton = $("startRestream");
   if (startButton.disabled) return;
-  if (!state.selectedVideoId) {
+  const useS3Source = $("useS3Source").checked;
+  if (!useS3Source && !state.selectedVideoId) {
     setFormStatus("Select a video first.", "error");
     return;
   }
   const payload = {
-    video_id: state.selectedVideoId,
+    video_id: useS3Source ? null : state.selectedVideoId,
+    s3_source: useS3Source ? $("s3Source").value.trim() : null,
     camera_name: $("cameraName").value || null,
     rtsp_path: $("rtspPath").value,
     username: $("username").value || null,

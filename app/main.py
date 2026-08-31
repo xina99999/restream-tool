@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -63,7 +63,8 @@ RESUMABLE_STATUSES = ("PENDING", "RUNNING")
 
 
 class RestreamStartRequest(BaseModel):
-    video_id: str = Field(min_length=1)
+    video_id: Optional[str] = None
+    s3_source: Optional[str] = None
     camera_code: Optional[str] = None
     camera_name: Optional[str] = None
     camera_ip: Optional[str] = None
@@ -149,6 +150,7 @@ def init_storage() -> None:
                 h264_crf INTEGER DEFAULT 23,
                 h264_preset TEXT DEFAULT 'veryfast',
                 h264_gop INTEGER DEFAULT 30,
+                source_url TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 ended_at TEXT
@@ -177,6 +179,8 @@ def init_storage() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN h264_preset TEXT DEFAULT 'veryfast'")
         if "h264_gop" not in existing_job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN h264_gop INTEGER DEFAULT 30")
+        if "source_url" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
         existing_video_columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(videos)").fetchall()
@@ -356,6 +360,8 @@ def prune_missing_videos() -> int:
     for row in rows:
         if row["job_count"] > 0:
             continue
+        if is_remote_source(row["path"]) or row["path"].startswith("s3://"):
+            continue
         if Path(row["path"]).exists():
             continue
         db_execute("DELETE FROM videos WHERE id = ?", (row["id"],))
@@ -386,6 +392,11 @@ def row_to_dict(row: sqlite3.Row) -> dict:
 
 def video_row_to_dict(row: sqlite3.Row) -> dict:
     item = dict(row)
+    if is_remote_source(item["path"]) or item["path"].startswith("s3://"):
+        item["source_type"] = "s3"
+        item["path"] = None
+        item["modified_at"] = item["created_at"]
+        return item
     try:
         modified_at = datetime.fromtimestamp(Path(item["path"]).stat().st_mtime, timezone.utc).isoformat()
     except Exception:
@@ -396,6 +407,7 @@ def video_row_to_dict(row: sqlite3.Row) -> dict:
 
 def job_row_to_dict(row: sqlite3.Row) -> dict:
     item = dict(row)
+    source_url = item.pop("source_url", None)
     video = {
         "id": item.pop("video_id_joined", None),
         "original_name": item.pop("video_original_name", None),
@@ -404,6 +416,9 @@ def job_row_to_dict(row: sqlite3.Row) -> dict:
         "duration_seconds": item.pop("video_duration_seconds", None),
         "created_at": item.pop("video_created_at", None),
     }
+    if source_url:
+        video["path"] = None
+    item["source_type"] = "s3" if source_url else "local"
     item["video"] = video if video["id"] else None
     return item
 
@@ -450,6 +465,28 @@ def assert_video_has_no_active_job(video_id: str) -> None:
         )
 
 
+def assert_s3_source_has_no_active_job(source_url: str) -> None:
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+    active_job = db_fetchone(
+        f"""
+        SELECT id, status, rtsp_path
+        FROM jobs
+        WHERE source_url = ? AND status IN ({placeholders})
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (source_url, *ACTIVE_STATUSES),
+    )
+    if active_job:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This S3 source already has an active restream job "
+                f"({active_job['status']}): {active_job['id']}. Stop it before starting another process."
+            ),
+        )
+
+
 def resume_active_jobs() -> None:
     placeholders = ",".join("?" for _ in RESUMABLE_STATUSES)
     rows = db_fetchall(
@@ -463,8 +500,8 @@ def resume_active_jobs() -> None:
         RESUMABLE_STATUSES,
     )
     for row in rows:
-        video_path = Path(row["video_path"] or "")
-        if not video_path.exists():
+        source_ref = row["source_url"] or row["video_path"] or ""
+        if not row["source_url"] and not Path(source_ref).exists():
             db_execute(
                 "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
                 ("FAILED", "Cannot resume because video file is missing", utc_now(), row["id"]),
@@ -480,7 +517,7 @@ def resume_active_jobs() -> None:
         try:
             start_ffmpeg_job(
                 row["id"],
-                video_path,
+                resolve_s3_source(source_ref) if row["source_url"] else Path(source_ref),
                 row["publish_url"],
                 transport,
                 loop,
@@ -497,6 +534,12 @@ def resume_active_jobs() -> None:
                 ("FAILED", f"{FFMPEG_BIN} not found", utc_now(), row["id"]),
             )
             add_log(row["id"], "SYSTEM", f"Cannot resume because {FFMPEG_BIN} was not found")
+        except HTTPException as error:
+            db_execute(
+                "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+                ("FAILED", str(error.detail), utc_now(), row["id"]),
+            )
+            add_event(row["id"], "RESUME_FAILED", str(error.detail), offset)
 
 
 async def save_uploaded_video(file: UploadFile) -> dict:
@@ -542,7 +585,7 @@ async def save_uploaded_video(file: UploadFile) -> dict:
 
 
 def add_log(job_id: str, level: str, message: str) -> None:
-    trimmed = message.strip()
+    trimmed = re.sub(r"https?://[^\s\"']+", "[remote-url-hidden]", message.strip())
     if not trimmed:
         return
     db_execute(
@@ -603,6 +646,35 @@ def get_duration_seconds(path: Path) -> Optional[float]:
         return None
 
 
+def is_remote_source(value: str) -> bool:
+    return value.startswith("https://") or value.startswith("http://")
+
+
+def resolve_s3_source(source: str) -> str:
+    normalized = source.strip()
+    if is_remote_source(normalized):
+        return normalized
+    parsed = urlparse(normalized)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise HTTPException(status_code=400, detail="S3 source must be s3://bucket/key or an HTTPS presigned URL")
+    try:
+        import boto3
+
+        return boto3.client("s3").generate_presigned_url(
+            "get_object",
+            Params={"Bucket": parsed.netloc, "Key": parsed.path.lstrip("/")},
+            ExpiresIn=86400,
+        )
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Cannot create S3 download URL: {error}")
+
+
+def source_display_name(source: str) -> str:
+    parsed = urlparse(source)
+    name = Path(parsed.path).name
+    return name or "S3 video"
+
+
 def capture_job_frame(job_id: str) -> Path:
     job = db_fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
     if not job:
@@ -610,8 +682,8 @@ def capture_job_frame(job_id: str) -> Path:
     video = db_fetchone("SELECT * FROM videos WHERE id = ?", (job["video_id"],))
     if not video:
         raise HTTPException(status_code=404, detail="video not found")
-    video_path = Path(video["path"])
-    if not video_path.exists():
+    input_source = resolve_s3_source(job["source_url"]) if job["source_url"] else video["path"]
+    if not is_remote_source(input_source) and not Path(input_source).exists():
         raise HTTPException(status_code=404, detail="video file is missing on disk")
     offset = max(0.0, float(job["out_time_seconds"] or 0))
     frame_path = FRAME_DIR / f"{job_id}.jpg"
@@ -625,7 +697,7 @@ def capture_job_frame(job_id: str) -> Path:
                 "-ss",
                 f"{offset:.3f}",
                 "-i",
-                str(video_path),
+                input_source,
                 "-frames:v",
                 "1",
                 "-q:v",
@@ -858,7 +930,7 @@ def monitor_process(
 
 def start_ffmpeg_job(
     job_id: str,
-    video_path: Path,
+    video_path: str | Path,
     publish_url: str,
     transport: str,
     loop: bool,
@@ -910,10 +982,12 @@ def start_ffmpeg_job(
         "UPDATE jobs SET status = ?, started_at = ?, ended_at = NULL, exit_code = NULL, last_error = NULL WHERE id = ?",
         ("RUNNING", utc_now(), job_id),
     )
-    if start_offset_seconds > 0:
-        add_log(job_id, "SYSTEM", f"Started from offset {start_offset_seconds:.2f}s: " + " ".join(args[:-1]) + " [rtsp-url-hidden]")
-    else:
-        add_log(job_id, "SYSTEM", "Started: " + " ".join(args[:-1]) + " [rtsp-url-hidden]")
+    logged_args = list(args[:-1])
+    input_index = logged_args.index("-i") + 1
+    if is_remote_source(str(video_path)):
+        logged_args[input_index] = "[remote-source-hidden]"
+    prefix = f"Started from offset {start_offset_seconds:.2f}s: " if start_offset_seconds > 0 else "Started: "
+    add_log(job_id, "SYSTEM", prefix + " ".join(logged_args) + " [rtsp-url-hidden]")
     threading.Thread(
         target=monitor_process,
         args=(job_id, process, duration, start_offset_seconds, loop),
@@ -954,8 +1028,8 @@ def maybe_auto_retry_job(job_id: str) -> None:
     if not video:
         add_event(job_id, "AUTO_RESUME_SKIPPED", "Video metadata is missing")
         return
-    video_path = Path(video["path"])
-    if not video_path.exists():
+    source_ref = job["source_url"] or video["path"]
+    if not job["source_url"] and not Path(source_ref).exists():
         db_execute(
             "UPDATE jobs SET last_error = ? WHERE id = ?",
             ("Auto resume failed because video file is missing", job_id),
@@ -998,7 +1072,7 @@ def maybe_auto_retry_job(job_id: str) -> None:
     try:
         start_ffmpeg_job(
             job_id,
-            video_path,
+            resolve_s3_source(source_ref) if job["source_url"] else Path(source_ref),
             job["publish_url"],
             job["rtsp_transport"] or "tcp",
             bool(job["loop"]),
@@ -1015,6 +1089,9 @@ def maybe_auto_retry_job(job_id: str) -> None:
             ("FAILED", f"{FFMPEG_BIN} not found", utc_now(), job_id),
         )
         add_event(job_id, "AUTO_RESUME_FAILED", f"{FFMPEG_BIN} was not found", offset)
+    except HTTPException as error:
+        db_execute("UPDATE jobs SET status = ?, last_error = ? WHERE id = ?", ("FAILED", str(error.detail), job_id))
+        add_event(job_id, "AUTO_RESUME_FAILED", str(error.detail), offset)
 
 
 @asynccontextmanager
@@ -1105,13 +1182,34 @@ def scan_videos():
 @app.post("/api/jobs")
 def start_job(request: RestreamStartRequest):
     with job_action_lock:
-        video = db_fetchone("SELECT * FROM videos WHERE id = ?", (request.video_id,))
-        if not video:
-            raise HTTPException(status_code=404, detail="video not found")
-        assert_video_has_no_active_job(request.video_id)
-        video_path = Path(video["path"])
-        if not video_path.exists():
-            raise HTTPException(status_code=404, detail="video file is missing on disk")
+        source_url = None
+        if request.s3_source and request.s3_source.strip():
+            source_url = request.s3_source.strip()
+            assert_s3_source_has_no_active_job(source_url)
+            input_source = resolve_s3_source(source_url)
+            video_id = str(uuid.uuid4())
+            video = {
+                "id": video_id,
+                "path": source_url,
+                "duration_seconds": None,
+            }
+            db_execute(
+                """
+                INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (video_id, source_display_name(request.s3_source), source_url, 0, None, utc_now()),
+            )
+        else:
+            if not request.video_id:
+                raise HTTPException(status_code=400, detail="Select a local video or provide an S3 source")
+            video = db_fetchone("SELECT * FROM videos WHERE id = ?", (request.video_id,))
+            if not video:
+                raise HTTPException(status_code=404, detail="video not found")
+            assert_video_has_no_active_job(request.video_id)
+            if not Path(video["path"]).exists():
+                raise HTTPException(status_code=404, detail="video file is missing on disk")
+            input_source = video["path"]
         rtsp_path = validate_rtsp_path(request.rtsp_path)
         camera_code = request.camera_code or rtsp_path
         transport = request.rtsp_transport.lower()
@@ -1150,12 +1248,12 @@ def start_job(request: RestreamStartRequest):
             INSERT INTO jobs(
                 id, video_id, camera_code, camera_name, camera_ip, rtsp_path, publish_url, view_url,
                 duration_seconds, rtsp_transport, loop, auto_retry, max_retries,
-                encoding_profile, h264_crf, h264_preset, h264_gop, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                encoding_profile, h264_crf, h264_preset, h264_gop, source_url, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
-                request.video_id,
+                video["id"],
                 camera_code,
                 request.camera_name,
                 request.camera_ip,
@@ -1171,6 +1269,7 @@ def start_job(request: RestreamStartRequest):
                 h264_crf,
                 h264_preset,
                 h264_gop,
+                source_url,
                 "PENDING",
                 utc_now(),
             ),
@@ -1184,7 +1283,7 @@ def start_job(request: RestreamStartRequest):
     try:
         start_ffmpeg_job(
             job_id,
-            video_path,
+            input_source,
             publish_url,
             transport,
             loop,
@@ -1200,7 +1299,14 @@ def start_job(request: RestreamStartRequest):
             ("FAILED", f"{FFMPEG_BIN} not found", utc_now(), job_id),
         )
         raise HTTPException(status_code=500, detail=f"{FFMPEG_BIN} not found")
-    return row_to_dict(db_fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,)))
+    except HTTPException as error:
+        db_execute(
+            "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+            ("FAILED", str(error.detail), utc_now(), job_id),
+        )
+        add_event(job_id, "SESSION_START_FAILED", str(error.detail))
+        raise
+    return get_job(job_id)
 
 
 @app.get("/api/jobs")
@@ -1246,8 +1352,8 @@ def resume_job(job_id: str):
     video = db_fetchone("SELECT * FROM videos WHERE id = ?", (job["video_id"],))
     if not video:
         raise HTTPException(status_code=404, detail="video not found")
-    video_path = Path(video["path"])
-    if not video_path.exists():
+    source_ref = job["source_url"] or video["path"]
+    if not job["source_url"] and not Path(source_ref).exists():
         raise HTTPException(status_code=404, detail="video file is missing on disk")
     offset = float(job["out_time_seconds"] or 0)
     if job["loop"] and job["duration_seconds"]:
@@ -1262,7 +1368,7 @@ def resume_job(job_id: str):
     try:
         start_ffmpeg_job(
             job_id,
-            video_path,
+            resolve_s3_source(source_ref) if job["source_url"] else Path(source_ref),
             job["publish_url"],
             job["rtsp_transport"] or "tcp",
             bool(job["loop"]),
@@ -1279,6 +1385,13 @@ def resume_job(job_id: str):
             ("FAILED", f"{FFMPEG_BIN} not found", utc_now(), job_id),
         )
         raise HTTPException(status_code=500, detail=f"{FFMPEG_BIN} not found")
+    except HTTPException as error:
+        db_execute(
+            "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+            ("FAILED", str(error.detail), utc_now(), job_id),
+        )
+        add_event(job_id, "MANUAL_RESUME_FAILED", str(error.detail), offset)
+        raise
     return get_job(job_id)
 
 
@@ -1316,8 +1429,8 @@ def restart_job(job_id: str, request: Optional[RestartJobRequest] = None):
     video = db_fetchone("SELECT * FROM videos WHERE id = ?", (job["video_id"],))
     if not video:
         raise HTTPException(status_code=404, detail="video not found")
-    video_path = Path(video["path"])
-    if not video_path.exists():
+    source_ref = job["source_url"] or video["path"]
+    if not job["source_url"] and not Path(source_ref).exists():
         raise HTTPException(status_code=404, detail="video file is missing on disk")
     if job["status"] in ACTIVE_STATUSES:
         add_event(job_id, "RESTART_REQUESTED", "Restart requested; stopping current process first")
@@ -1354,7 +1467,7 @@ def restart_job(job_id: str, request: Optional[RestartJobRequest] = None):
     try:
         start_ffmpeg_job(
             job_id,
-            video_path,
+            resolve_s3_source(source_ref) if job["source_url"] else Path(source_ref),
             job["publish_url"],
             job["rtsp_transport"] or "tcp",
             bool(job["loop"]),
@@ -1371,6 +1484,13 @@ def restart_job(job_id: str, request: Optional[RestartJobRequest] = None):
             ("FAILED", f"{FFMPEG_BIN} not found", utc_now(), job_id),
         )
         raise HTTPException(status_code=500, detail=f"{FFMPEG_BIN} not found")
+    except HTTPException as error:
+        db_execute(
+            "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+            ("FAILED", str(error.detail), utc_now(), job_id),
+        )
+        add_event(job_id, "RUN_AGAIN_FAILED", str(error.detail), start_offset)
+        raise
     return get_job(job_id)
 
 

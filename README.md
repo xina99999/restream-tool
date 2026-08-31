@@ -10,6 +10,7 @@ Standalone tool for uploading a video and restreaming it to MediaMTX with ffmpeg
 - Show clear UI notifications when an action fails or succeeds.
 - Search and sort videos by newest, oldest, name or duration.
 - Enter an RTSP path and connection settings.
+- Restream directly from an S3 presigned HTTPS URL or `s3://bucket/key`.
 - Choose copy mode or an H.264 low-latency profile, with per-session CRF, preset and GOP settings.
 - Start/stop ffmpeg restream jobs.
 - Allow only one active ffmpeg process per video.
@@ -45,6 +46,18 @@ Open:
 ```text
 http://localhost:8090
 ```
+
+## S3 Restream
+
+In the **Restream** panel, tick **Restream from S3**, then paste either:
+
+```text
+s3://your-bucket/path/to/video.mp4
+```
+
+or an HTTPS presigned URL. For `s3://` sources, set `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` in `.env`, then rebuild with `docker compose up -d --build`. An HTTPS presigned URL needs no AWS credentials in the container.
+
+The tool reads the remote video directly with FFmpeg; it does not download a full local copy first. Resume, Run Again, auto-retry, frame capture, and container-start recovery re-create the temporary URL for an `s3://` source. A presigned HTTPS URL must remain valid for the whole restream session.
 
 ## Retry behavior
 

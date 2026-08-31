@@ -73,6 +73,14 @@
             RTSP path
             <input id="rtspPath" required placeholder="test1_linfox_DCVSIP-192_168_253_8" />
           </label>
+          <label class="check">
+            <input id="useS3Source" type="checkbox" />
+            Restream from S3
+          </label>
+          <label id="s3SourceField" hidden>
+            S3 source
+            <input id="s3Source" placeholder="s3://bucket/video.mp4 or HTTPS presigned URL" />
+          </label>
           <label>
             Stream profile
             <select id="encodingProfile">
