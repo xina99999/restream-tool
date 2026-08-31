@@ -186,6 +186,17 @@ def init_storage() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS video_file_cache (
+                path TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                modified_at_ns INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id TEXT NOT NULL,
@@ -223,13 +234,38 @@ def file_content_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def cached_file_content_hash(path: Path) -> str:
+    stat = path.stat()
+    cache = db_fetchone("SELECT * FROM video_file_cache WHERE path = ?", (str(path),))
+    if (
+        cache
+        and cache["size_bytes"] == stat.st_size
+        and cache["modified_at_ns"] == stat.st_mtime_ns
+    ):
+        return cache["content_hash"]
+    content_hash = file_content_hash(path)
+    db_execute(
+        """
+        INSERT INTO video_file_cache(path, size_bytes, modified_at_ns, content_hash, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            size_bytes = excluded.size_bytes,
+            modified_at_ns = excluded.modified_at_ns,
+            content_hash = excluded.content_hash,
+            updated_at = excluded.updated_at
+        """,
+        (str(path), stat.st_size, stat.st_mtime_ns, content_hash, utc_now()),
+    )
+    return content_hash
+
+
 def backfill_video_hash(row: sqlite3.Row) -> Optional[str]:
     if row["content_hash"]:
         return row["content_hash"]
     path = Path(row["path"])
     if not path.exists():
         return None
-    content_hash = file_content_hash(path)
+    content_hash = cached_file_content_hash(path)
     db_execute("UPDATE videos SET content_hash = ? WHERE id = ?", (content_hash, row["id"]))
     return content_hash
 
@@ -281,7 +317,7 @@ def scan_video_libraries() -> int:
             existing = db_fetchone("SELECT id FROM videos WHERE path = ?", (str(absolute_path),))
             if existing:
                 continue
-            content_hash = file_content_hash(absolute_path)
+            content_hash = cached_file_content_hash(absolute_path)
             duplicate = db_fetchone("SELECT id FROM videos WHERE content_hash = ?", (content_hash,))
             if duplicate:
                 continue

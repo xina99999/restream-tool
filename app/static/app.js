@@ -8,6 +8,7 @@ const state = {
   uploading: false,
   showRawLogs: false,
   refreshTimer: null,
+  bootRetryTimer: null,
   toastTimer: null,
 };
 
@@ -588,7 +589,15 @@ $("jobsBody").addEventListener("click", async (event) => {
   }
 });
 
-$("refreshJobs").addEventListener("click", loadJobs);
+async function refreshJobsSafely() {
+  try {
+    await loadJobs();
+  } catch (error) {
+    notify("Connection to the tool was interrupted. Retrying...", "error");
+  }
+}
+
+$("refreshJobs").addEventListener("click", refreshJobsSafely);
 $("toggleRawLogs").addEventListener("click", async () => {
   state.showRawLogs = !state.showRawLogs;
   $("toggleRawLogs").textContent = state.showRawLogs ? "Hide Raw" : "Show Raw";
@@ -650,12 +659,18 @@ document.querySelectorAll("[data-toggle-panel]").forEach((button) => {
 });
 
 async function boot() {
-  await loadConfig();
-  await loadVideos();
-  await loadJobs();
-  state.refreshTimer = setInterval(loadJobs, 2500);
+  try {
+    await loadConfig();
+    await loadVideos();
+    await loadJobs();
+    if (!state.refreshTimer) {
+      state.refreshTimer = setInterval(refreshJobsSafely, 2500);
+    }
+  } catch (error) {
+    notify("Connecting to the tool... retrying shortly.", "error");
+    clearTimeout(state.bootRetryTimer);
+    state.bootRetryTimer = setTimeout(boot, 1500);
+  }
 }
 
-boot().catch((error) => {
-  alert(error.message);
-});
+boot();
