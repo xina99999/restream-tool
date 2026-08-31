@@ -293,7 +293,7 @@ async function openJobDetails(jobId) {
     <div><strong>Video</strong><span>${escapeHtml(video.original_name || "-")}</span></div>
     <div><strong>Source</strong><span>${job.source_type === "s3" ? "S3 / remote URL" : escapeHtml(video.path || "-")}</span></div>
     <div><strong>Camera</strong><span>${escapeHtml(job.camera_name || job.camera_code || "-")}</span></div>
-    <div><strong>RTSP path</strong><span>${escapeHtml(job.rtsp_path)}</span></div>
+    <div><strong>Camera code</strong><span>${escapeHtml(job.rtsp_path)}</span></div>
     <div><strong>Progress</strong><span>${Number(job.progress_percent || 0).toFixed(1)}%</span></div>
     <div><strong>Out time</strong><span>${formatDuration(job.out_time_seconds)}</span></div>
     <div><strong>Duration</strong><span>${formatDuration(job.duration_seconds || video.duration_seconds)}</span></div>
