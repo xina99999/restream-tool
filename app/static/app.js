@@ -360,7 +360,13 @@ async function uploadFiles(fileList) {
       $("uploadProgress").hidden = true;
     }
   }, 1800);
-  notify(`Uploaded ${result.count || files.length} video(s).`, "success");
+  const duplicateCount = (result.items || []).filter((item) => item.duplicate).length;
+  notify(
+    duplicateCount
+      ? `Upload complete. ${duplicateCount} duplicate video(s) reused from the library.`
+      : `Uploaded ${result.count || files.length} video(s).`,
+    "success",
+  );
 }
 
 function setUploadProgress(percent, text) {
@@ -445,7 +451,10 @@ $("scanVideos").addEventListener("click", async () => {
   try {
     const result = await api("/api/videos/scan", { method: "POST" });
     await loadVideos();
-    notify(`Scan done. Imported ${result.imported || 0}, removed ${result.pruned || 0}.`, "success");
+    notify(
+      `Scan done. Imported ${result.imported || 0}, merged ${result.deduplicated || 0}, removed ${result.pruned || 0}.`,
+      "success",
+    );
   } catch (error) {
     notify(error.message, "error");
   }

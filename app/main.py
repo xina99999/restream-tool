@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 import signal
 import sqlite3
@@ -96,6 +97,7 @@ class RuntimeProcess:
 runtime_processes: dict[str, RuntimeProcess] = {}
 runtime_lock = threading.Lock()
 job_action_lock = threading.Lock()
+video_registry_lock = threading.Lock()
 shutdown_event = threading.Event()
 
 
@@ -116,6 +118,7 @@ def init_storage() -> None:
                 path TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL,
                 duration_seconds REAL,
+                content_hash TEXT,
                 created_at TEXT NOT NULL
             )
             """
@@ -174,6 +177,13 @@ def init_storage() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN h264_preset TEXT DEFAULT 'veryfast'")
         if "h264_gop" not in existing_job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN h264_gop INTEGER DEFAULT 30")
+        existing_video_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(videos)").fetchall()
+        }
+        if "content_hash" not in existing_video_columns:
+            conn.execute("ALTER TABLE videos ADD COLUMN content_hash TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_hash ON videos(content_hash)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS logs (
@@ -205,6 +215,59 @@ def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
 
 
+def file_content_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def backfill_video_hash(row: sqlite3.Row) -> Optional[str]:
+    if row["content_hash"]:
+        return row["content_hash"]
+    path = Path(row["path"])
+    if not path.exists():
+        return None
+    content_hash = file_content_hash(path)
+    db_execute("UPDATE videos SET content_hash = ? WHERE id = ?", (content_hash, row["id"]))
+    return content_hash
+
+
+def merge_duplicate_video_records() -> int:
+    merged = 0
+    candidates = db_fetchall(
+        """
+        SELECT original_name, size_bytes
+        FROM videos
+        GROUP BY original_name, size_bytes
+        HAVING COUNT(*) > 1
+        """
+    )
+    for candidate in candidates:
+        rows = db_fetchall(
+            """
+            SELECT * FROM videos
+            WHERE original_name = ? AND size_bytes = ?
+            ORDER BY created_at ASC
+            """,
+            (candidate["original_name"], candidate["size_bytes"]),
+        )
+        by_hash: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            content_hash = backfill_video_hash(row)
+            if not content_hash:
+                continue
+            canonical = by_hash.get(content_hash)
+            if not canonical:
+                by_hash[content_hash] = row
+                continue
+            db_execute("UPDATE jobs SET video_id = ? WHERE video_id = ?", (canonical["id"], row["id"]))
+            db_execute("DELETE FROM videos WHERE id = ?", (row["id"],))
+            merged += 1
+    return merged
+
+
 def scan_video_libraries() -> int:
     imported = 0
     candidates = [UPLOAD_DIR, *LIBRARY_DIRS]
@@ -218,12 +281,17 @@ def scan_video_libraries() -> int:
             existing = db_fetchone("SELECT id FROM videos WHERE path = ?", (str(absolute_path),))
             if existing:
                 continue
+            content_hash = file_content_hash(absolute_path)
+            duplicate = db_fetchone("SELECT id FROM videos WHERE content_hash = ?", (content_hash,))
+            if duplicate:
+                continue
             video_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(absolute_path)))
             duration = get_duration_seconds(absolute_path)
             db_execute(
                 """
-                INSERT OR IGNORE INTO videos(id, original_name, path, size_bytes, duration_seconds, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO videos(
+                    id, original_name, path, size_bytes, duration_seconds, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     video_id,
@@ -231,6 +299,7 @@ def scan_video_libraries() -> int:
                     str(absolute_path),
                     absolute_path.stat().st_size,
                     duration,
+                    content_hash,
                     utc_now(),
                 ),
             )
@@ -412,15 +481,27 @@ async def save_uploaded_video(file: UploadFile) -> dict:
             size += len(chunk)
             output.write(chunk)
     duration = get_duration_seconds(target_path)
-    db_execute(
-        "INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (video_id, safe_name, str(target_path), size, duration, utc_now()),
-    )
+    content_hash = file_content_hash(target_path)
+    with video_registry_lock:
+        duplicate = db_fetchone("SELECT * FROM videos WHERE content_hash = ?", (content_hash,))
+        if duplicate:
+            target_path.unlink(missing_ok=True)
+            item = video_row_to_dict(duplicate)
+            item["duplicate"] = True
+            return item
+        db_execute(
+            """
+            INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, content_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (video_id, safe_name, str(target_path), size, duration, content_hash, utc_now()),
+        )
     return {
         "id": video_id,
         "original_name": safe_name,
         "size_bytes": size,
         "duration_seconds": duration,
+        "duplicate": False,
     }
 
 
@@ -968,17 +1049,21 @@ async def upload_videos(files: list[UploadFile] = File(...)):
 
 @app.get("/api/videos")
 def list_video():
-    scan_video_libraries()
-    prune_missing_videos()
+    with video_registry_lock:
+        scan_video_libraries()
+        merge_duplicate_video_records()
+        prune_missing_videos()
     rows = db_fetchall("SELECT * FROM videos ORDER BY created_at DESC")
     return [video_row_to_dict(row) for row in rows]
 
 
 @app.post("/api/videos/scan")
 def scan_videos():
-    imported = scan_video_libraries()
-    pruned = prune_missing_videos()
-    return {"imported": imported, "pruned": pruned}
+    with video_registry_lock:
+        imported = scan_video_libraries()
+        deduplicated = merge_duplicate_video_records()
+        pruned = prune_missing_videos()
+    return {"imported": imported, "deduplicated": deduplicated, "pruned": pruned}
 
 
 @app.post("/api/jobs")
