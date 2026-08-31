@@ -2,6 +2,17 @@
 
 Standalone tool for uploading a video and restreaming it to MediaMTX with ffmpeg.
 
+## Project structure
+
+```text
+app/
+  controllers/api.py          HTTP routes and response handling
+  models/schemas.py           Pydantic request models
+  services/restream_service.py SQLite, S3, FFmpeg, and job runtime logic
+  main.py                     FastAPI application composition
+  static/                     Browser UI
+```
+
 ## Features
 
 - Upload video files to the server with browser-side upload progress.
