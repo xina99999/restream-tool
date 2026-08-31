@@ -103,6 +103,7 @@ input {
 
 .grid {
   grid-template-columns: minmax(360px, 1fr) minmax(320px, 0.9fr);
+  align-items: start;
   margin-bottom: 16px;
 }
 
