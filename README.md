@@ -16,6 +16,7 @@ app/
 ## Features
 
 - Upload video files to the server with browser-side upload progress.
+- Resume browser uploads from the last persisted 8 MB chunk after reconnecting and selecting the same file again.
 - Upload multiple files or a browser-selected folder.
 - Scan existing video folders mounted from the host.
 - Show clear UI notifications when an action fails or succeeds.
@@ -71,6 +72,10 @@ or an HTTPS presigned URL. For `s3://` sources, set `AWS_DEFAULT_REGION`, `AWS_A
 The tool reads the remote video directly with FFmpeg; it does not download a full local copy first. Resume, Run Again, auto-retry, frame capture, and container-start recovery re-create the temporary URL for an `s3://` source. A presigned HTTPS URL must remain valid for the whole restream session.
 
 To keep a local reusable copy, paste the same source into **Download S3** in the Video panel. The dedicated `restream-download-worker` service owns the download queue, reports downloaded bytes in the UI, resumes partial files after a worker/Docker restart, scans duration after completion, and adds the resulting file to the video library. Public S3 HTTPS URLs require no AWS credentials.
+
+## Resumable browser uploads
+
+Browser uploads are sent in 8 MB chunks and the partial file is stored in the Docker data volume. If the browser loses connection or the web container restarts, select the same local file again; the tool resumes from the last confirmed chunk. Keep the `restream-data` volume when redeploying so partial uploads remain available.
 
 ## Retry behavior
 

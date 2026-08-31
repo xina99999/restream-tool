@@ -33,3 +33,9 @@ class RestartJobRequest(BaseModel):
 
 class S3DownloadRequest(BaseModel):
     source: str = Field(min_length=1, max_length=4096)
+
+
+class UploadInitRequest(BaseModel):
+    original_name: str = Field(min_length=1, max_length=1024)
+    total_bytes: int = Field(gt=0)
+    client_key: str = Field(min_length=1, max_length=512)

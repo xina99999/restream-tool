@@ -1,7 +1,7 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from app.models.schemas import RestartJobRequest, RestreamStartRequest, S3DownloadRequest
+from app.models.schemas import RestartJobRequest, RestreamStartRequest, S3DownloadRequest, UploadInitRequest
 from app.services.restream_service import *
 
 
@@ -50,6 +50,21 @@ async def upload_videos(files: list[UploadFile] = File(...)):
     for file in files:
         uploaded.append(await save_uploaded_video(file))
     return {"count": len(uploaded), "items": uploaded}
+
+
+@router.post("/api/uploads/init")
+def init_upload(request: UploadInitRequest):
+    return init_resumable_upload(request.original_name, request.total_bytes, request.client_key)
+
+
+@router.put("/api/uploads/{upload_id}/chunk")
+async def upload_chunk(upload_id: str, request: Request, offset: int):
+    return append_upload_chunk(upload_id, offset, await request.body())
+
+
+@router.post("/api/uploads/{upload_id}/complete")
+def complete_upload(upload_id: str):
+    return complete_resumable_upload(upload_id)
 
 
 @router.get("/api/videos")

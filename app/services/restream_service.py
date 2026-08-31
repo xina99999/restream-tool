@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, UploadFile
 
@@ -22,6 +22,7 @@ from app.models.schemas import RestartJobRequest, RestreamStartRequest
 APP_ROOT = Path(__file__).resolve().parents[1]
 BASE_DIR = Path(os.getenv("RESTREAM_DATA_DIR", "/data"))
 UPLOAD_DIR = Path(os.getenv("RESTREAM_UPLOAD_DIR", str(BASE_DIR / "videos")))
+UPLOAD_STAGING_DIR = UPLOAD_DIR / ".uploads"
 FRAME_DIR = Path(os.getenv("RESTREAM_FRAME_DIR", str(BASE_DIR / "frames")))
 DB_PATH = Path(os.getenv("RESTREAM_DB_PATH", str(BASE_DIR / "restream.db")))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
@@ -72,6 +73,7 @@ runtime_lock = threading.Lock()
 job_action_lock = threading.Lock()
 video_registry_lock = threading.Lock()
 download_lock = threading.Lock()
+upload_lock = threading.Lock()
 shutdown_event = threading.Event()
 
 
@@ -82,6 +84,7 @@ def utc_now() -> str:
 def init_storage() -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_STAGING_DIR.mkdir(parents=True, exist_ok=True)
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -215,6 +218,24 @@ def init_storage() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uploads (
+                id TEXT PRIMARY KEY,
+                client_key TEXT NOT NULL UNIQUE,
+                original_name TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                received_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                video_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
 
 
 def is_video_file(path: Path) -> bool:
@@ -575,6 +596,126 @@ async def save_uploaded_video(file: UploadFile) -> dict:
     }
 
 
+def safe_upload_name(original_name: str, fallback: str) -> str:
+    parts = [
+        part.replace("/", "_").replace("\\", "_")
+        for part in Path(original_name.replace("\\", "/")).parts
+        if part not in {"", ".", ".."}
+    ]
+    return Path(*parts).as_posix() if parts else fallback
+
+
+def upload_row_to_dict(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item.pop("target_path", None)
+    item.pop("client_key", None)
+    return item
+
+
+def init_resumable_upload(original_name: str, total_bytes: int, client_key: str) -> dict:
+    with upload_lock:
+        existing = db_fetchone("SELECT * FROM uploads WHERE client_key = ?", (client_key,))
+        if existing:
+            if existing["total_bytes"] != total_bytes or existing["original_name"] != original_name:
+                raise HTTPException(status_code=409, detail="Upload key conflicts with a different file")
+            return upload_row_to_dict(existing)
+        upload_id = str(uuid.uuid4())
+        safe_name = safe_upload_name(original_name, f"{upload_id}.video")
+        target_path = UPLOAD_STAGING_DIR / f"{upload_id}_{safe_name}.part"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        now = utc_now()
+        db_execute(
+            """
+            INSERT INTO uploads(
+                id, client_key, original_name, target_path, total_bytes, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'UPLOADING', ?, ?)
+            """,
+            (upload_id, client_key, original_name, str(target_path), total_bytes, now, now),
+        )
+    row = db_fetchone("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+    return upload_row_to_dict(row)
+
+
+def append_upload_chunk(upload_id: str, offset: int, payload: bytes) -> dict:
+    if not payload:
+        raise HTTPException(status_code=400, detail="Upload chunk is empty")
+    with upload_lock:
+        row = db_fetchone("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="upload not found")
+        if row["status"] == "COMPLETED":
+            return upload_row_to_dict(row)
+        if row["status"] != "UPLOADING":
+            raise HTTPException(status_code=409, detail=f"upload is {row['status'].lower()}")
+        path = Path(row["target_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        actual_offset = path.stat().st_size if path.exists() else 0
+        if actual_offset != offset:
+            db_execute("UPDATE uploads SET received_bytes = ?, updated_at = ? WHERE id = ?", (actual_offset, utc_now(), upload_id))
+            raise HTTPException(status_code=409, detail=f"Expected chunk offset {actual_offset}")
+        next_offset = actual_offset + len(payload)
+        if next_offset > row["total_bytes"]:
+            raise HTTPException(status_code=400, detail="Upload chunk exceeds declared file size")
+        with path.open("ab") as output:
+            output.write(payload)
+        db_execute(
+            "UPDATE uploads SET received_bytes = ?, updated_at = ? WHERE id = ?",
+            (next_offset, utc_now(), upload_id),
+        )
+    updated = db_fetchone("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+    return upload_row_to_dict(updated)
+
+
+def complete_resumable_upload(upload_id: str) -> dict:
+    with upload_lock:
+        row = db_fetchone("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="upload not found")
+        if row["status"] == "COMPLETED":
+            return upload_row_to_dict(row)
+        path = Path(row["target_path"])
+        actual_size = path.stat().st_size if path.exists() else 0
+        if actual_size != row["total_bytes"]:
+            raise HTTPException(status_code=409, detail=f"Upload incomplete: {actual_size}/{row['total_bytes']} bytes")
+        video_id = str(uuid.uuid4())
+        safe_name = safe_upload_name(row["original_name"], f"{video_id}.video")
+        target_path = UPLOAD_DIR / f"{video_id}_{safe_name}"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(target_path)
+        try:
+            duration = get_duration_seconds(target_path)
+            content_hash = file_content_hash(target_path)
+            with video_registry_lock:
+                duplicate = db_fetchone("SELECT * FROM videos WHERE content_hash = ?", (content_hash,))
+                if duplicate:
+                    target_path.unlink(missing_ok=True)
+                    video_id = duplicate["id"]
+                else:
+                    db_execute(
+                        """
+                        INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, content_hash, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (video_id, safe_name, str(target_path), actual_size, duration, content_hash, utc_now()),
+                    )
+            db_execute(
+                """
+                UPDATE uploads
+                SET status = 'COMPLETED', received_bytes = ?, video_id = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (actual_size, video_id, utc_now(), utc_now(), upload_id),
+            )
+        except Exception as error:
+            db_execute(
+                "UPDATE uploads SET status = 'FAILED', error = ?, updated_at = ? WHERE id = ?",
+                (str(error)[-1000:], utc_now(), upload_id),
+            )
+            raise HTTPException(status_code=500, detail="Failed to finalize uploaded video")
+    completed = db_fetchone("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+    return upload_row_to_dict(completed)
+
+
 def add_log(job_id: str, level: str, message: str) -> None:
     trimmed = re.sub(r"https?://[^\s\"']+", "[remote-url-hidden]", message.strip())
     if not trimmed:
@@ -706,7 +847,7 @@ def download_source_to_library(download_id: str, source_url: str, original_name:
         headers = {"User-Agent": "RTSP-Restream-Tool/1.0"}
         if resume_at:
             headers["Range"] = f"bytes={resume_at}-"
-        request = Request(resolved_url, headers=headers)
+        request = UrlRequest(resolved_url, headers=headers)
         update_download(download_id, status="DOWNLOADING")
         with urlopen(request, timeout=30) as response:
             if resume_at and getattr(response, "status", None) != 206:

@@ -15,6 +15,7 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -393,24 +394,25 @@ async function uploadFiles(fileList) {
     notify("Upload is already running.", "error");
     return;
   }
-  const formData = new FormData();
-  for (const file of files) {
-    formData.append("files", file, file.webkitRelativePath || file.name);
+  const totalBytes = files.reduce((total, file) => total + file.size, 0);
+  let completedBytes = 0;
+  const items = [];
+  setUploadBusy(true);
+  try {
+    for (const file of files) {
+      items.push(await uploadFileInChunks(file, completedBytes, totalBytes));
+      completedBytes += file.size;
+    }
+    await loadVideos();
+    if (items[0]?.video_id || items[0]?.id) {
+      state.selectedVideoId = items[0].video_id || items[0].id;
+      renderVideos();
+    }
+    notify(`Uploaded ${files.length} video(s).`, "success");
+  } finally {
+    setUploadBusy(false);
+    $("uploadProgress").hidden = true;
   }
-  const result = await uploadWithProgress(formData, files);
-  await loadVideos();
-  if (result.items?.[0]) {
-    state.selectedVideoId = result.items[0].id;
-    renderVideos();
-  }
-  $("uploadProgress").hidden = true;
-  const duplicateCount = (result.items || []).filter((item) => item.duplicate).length;
-  notify(
-    duplicateCount
-      ? `Upload complete. ${duplicateCount} duplicate video(s) reused from the library.`
-      : `Uploaded ${result.count || files.length} video(s).`,
-    "success",
-  );
 }
 
 function setUploadProgress(percent, text) {
@@ -428,47 +430,36 @@ function setUploadBusy(isBusy) {
   $("scanVideos").disabled = isBusy;
 }
 
-function uploadWithProgress(formData, files) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/videos/batch");
-    setUploadBusy(true);
-    setUploadProgress(0, `Uploading ${files.length} file(s)...`);
-    xhr.upload.addEventListener("progress", (event) => {
-      if (!event.lengthComputable) return;
-      const percent = (event.loaded / event.total) * 100;
-      setUploadProgress(percent, `Uploading ${formatSize(event.loaded)} / ${formatSize(event.total)}`);
-    });
-    xhr.addEventListener("load", () => {
-      setUploadBusy(false);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        setUploadProgress(100, "Upload complete. Scanning video metadata...");
-        try {
-          resolve(JSON.parse(xhr.responseText || "{}"));
-        } catch (_) {
-          reject(new Error("Upload completed but response was invalid."));
-        }
-        return;
-      }
-      let detail = xhr.statusText || "Upload failed";
-      try {
-        const body = JSON.parse(xhr.responseText || "{}");
-        detail = body.detail || detail;
-      } catch (_) {
-        // keep default
-      }
-      reject(new Error(detail));
-    });
-    xhr.addEventListener("error", () => {
-      setUploadBusy(false);
-      reject(new Error("Upload failed because the connection was interrupted."));
-    });
-    xhr.addEventListener("abort", () => {
-      setUploadBusy(false);
-      reject(new Error("Upload was canceled."));
-    });
-    xhr.send(formData);
+async function uploadFileInChunks(file, completedBytes, totalBytes) {
+  const originalName = file.webkitRelativePath || file.name;
+  const clientKey = `${originalName}|${file.size}|${file.lastModified}`;
+  let session = await api("/api/uploads/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ original_name: originalName, total_bytes: file.size, client_key: clientKey }),
   });
+  let offset = Number(session.received_bytes || 0);
+  if (session.status === "COMPLETED") return session;
+
+  while (offset < file.size) {
+    const chunk = await file.slice(offset, offset + UPLOAD_CHUNK_BYTES).arrayBuffer();
+    session = await api(`/api/uploads/${session.id}/chunk?offset=${offset}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: chunk,
+    });
+    offset = Number(session.received_bytes || 0);
+    const totalCompleted = completedBytes + offset;
+    setUploadProgress(
+      totalBytes ? (totalCompleted / totalBytes) * 100 : 100,
+      `Uploading ${file.name}: ${formatSize(offset)} / ${formatSize(file.size)}`,
+    );
+  }
+  setUploadProgress(
+    totalBytes ? ((completedBytes + file.size) / totalBytes) * 100 : 100,
+    `Finalizing ${file.name}...`,
+  );
+  return api(`/api/uploads/${session.id}/complete`, { method: "POST" });
 }
 
 $("videoFiles").addEventListener("change", async (event) => {
