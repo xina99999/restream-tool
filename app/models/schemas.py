@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 class RestreamStartRequest(BaseModel):
     video_id: Optional[str] = None
     s3_source: Optional[str] = None
+    cache_local: bool = False
+    cache_buffer_seconds: int = Field(default=300, ge=30, le=1800)
     camera_code: Optional[str] = None
     camera_name: Optional[str] = None
     camera_ip: Optional[str] = None

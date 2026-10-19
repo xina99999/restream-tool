@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>RTSP Restream Tool</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260831-s3-download" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260917-s3-cache" />
   </head>
   <body>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -86,6 +86,19 @@
             S3 source
             <input id="s3Source" placeholder="s3://bucket/video.mp4 or HTTPS presigned URL" />
           </label>
+          <div id="s3CacheConfig" class="s3-cache-config" hidden>
+            <label class="check">
+              <input id="cacheLocal" type="checkbox" checked />
+              Download to local cache before restream
+            </label>
+            <label>
+              Start buffer
+              <select id="cacheBufferSeconds">
+                <option value="120">2 minutes</option>
+                <option value="300" selected>5 minutes</option>
+              </select>
+            </label>
+          </div>
           <label>
             Stream profile
             <select id="encodingProfile">
@@ -275,6 +288,6 @@
       </dialog>
     </main>
 
-    <script src="/static/app.js?v=20260831-upload-resume"></script>
+    <script src="/static/app.js?v=20260917-s3-cache"></script>
   </body>
 </html>

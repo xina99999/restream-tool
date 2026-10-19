@@ -105,22 +105,24 @@ def resume_s3_download(download_id: str):
 def start_job(request: RestreamStartRequest):
     with job_action_lock:
         source_url = None
+        cache_download = None
         if request.s3_source and request.s3_source.strip():
             source_url = request.s3_source.strip()
             assert_s3_source_has_no_active_job(source_url)
-            input_source = resolve_s3_source(source_url)
+            input_source = None if request.cache_local else resolve_s3_source(source_url)
             video_id = str(uuid.uuid4())
+            duration = None
             video = {
                 "id": video_id,
                 "path": source_url,
-                "duration_seconds": None,
+                "duration_seconds": duration,
             }
             db_execute(
                 """
                 INSERT INTO videos(id, original_name, path, size_bytes, duration_seconds, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (video_id, source_display_name(request.s3_source), source_url, 0, None, utc_now()),
+                (video_id, source_display_name(request.s3_source), source_url, 0, duration, utc_now()),
             )
         else:
             if not request.video_id:
@@ -170,8 +172,9 @@ def start_job(request: RestreamStartRequest):
             INSERT INTO jobs(
                 id, video_id, camera_code, camera_name, camera_ip, rtsp_path, publish_url, view_url,
                 duration_seconds, rtsp_transport, loop, auto_retry, max_retries,
-                encoding_profile, h264_crf, h264_preset, h264_gop, source_url, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                encoding_profile, h264_crf, h264_preset, h264_gop, source_url,
+                cache_local, cache_status, cache_buffer_seconds, download_id, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -192,7 +195,11 @@ def start_job(request: RestreamStartRequest):
                 h264_preset,
                 h264_gop,
                 source_url,
-                "PENDING",
+                1 if request.cache_local and source_url else 0,
+                "QUEUED" if request.cache_local and source_url else None,
+                request.cache_buffer_seconds if request.cache_local and source_url else None,
+                None,
+                "BUFFERING" if request.cache_local and source_url else "PENDING",
                 utc_now(),
             ),
         )
@@ -203,6 +210,24 @@ def start_job(request: RestreamStartRequest):
         )
         add_event(job_id, "SESSION_CREATED", f"Profile selected: {profile_summary}")
     try:
+        if source_url and request.cache_local:
+            cache_download = start_s3_download(source_url)
+            db_execute("UPDATE jobs SET download_id = ? WHERE id = ?", (cache_download["id"], job_id))
+            add_event(job_id, "DOWNLOAD_STARTED", "Original video download queued for local storage")
+            start_cached_s3_restream(
+                job_id,
+                source_url,
+                publish_url,
+                transport,
+                loop,
+                duration,
+                encoding_profile,
+                h264_crf,
+                h264_preset,
+                h264_gop,
+                request.cache_buffer_seconds,
+            )
+            return get_job(job_id)
         start_ffmpeg_job(
             job_id,
             input_source,
@@ -250,6 +275,7 @@ def stop_job(job_id: str):
     row = db_fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
     if not row:
         raise HTTPException(status_code=404, detail="job not found")
+    terminate_cache_process(job_id)
     with runtime_lock:
         runtime = runtime_processes.get(job_id)
     if not runtime or runtime.process.poll() is not None:

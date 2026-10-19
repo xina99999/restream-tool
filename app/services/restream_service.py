@@ -59,22 +59,32 @@ DEFAULT_H264_GOP = 30
 SAFE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 TIME_PATTERN = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m4v", ".webm"}
-ACTIVE_STATUSES = ("PENDING", "RUNNING", "STOPPING")
+ACTIVE_STATUSES = ("PENDING", "BUFFERING", "RUNNING", "STOPPING")
 RESUMABLE_STATUSES = ("PENDING", "RUNNING")
+INPUT_INTEGRITY_ERROR_MARKERS = (
+    "stream ends prematurely",
+    "partial file",
+    "error during demuxing: input/output error",
+)
 
 
 class RuntimeProcess:
     def __init__(self, process: subprocess.Popen):
         self.process = process
+        self.input_integrity_error: Optional[str] = None
 
 
 runtime_processes: dict[str, RuntimeProcess] = {}
 runtime_lock = threading.Lock()
+retrying_jobs: set[str] = set()
+retry_lock = threading.Lock()
 job_action_lock = threading.Lock()
 video_registry_lock = threading.Lock()
 download_lock = threading.Lock()
 upload_lock = threading.Lock()
 shutdown_event = threading.Event()
+cache_processes: dict[str, subprocess.Popen] = {}
+cache_lock = threading.Lock()
 
 
 def utc_now() -> str:
@@ -86,6 +96,7 @@ def init_storage() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_STAGING_DIR.mkdir(parents=True, exist_ok=True)
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    (BASE_DIR / "cache").mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -127,6 +138,11 @@ def init_storage() -> None:
                 h264_preset TEXT DEFAULT 'veryfast',
                 h264_gop INTEGER DEFAULT 30,
                 source_url TEXT,
+                cache_local INTEGER DEFAULT 0,
+                cache_status TEXT,
+                cache_buffer_seconds INTEGER,
+                cache_duration_seconds REAL DEFAULT 0,
+                download_id TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 ended_at TEXT
@@ -157,6 +173,16 @@ def init_storage() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN h264_gop INTEGER DEFAULT 30")
         if "source_url" not in existing_job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+        if "cache_local" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cache_local INTEGER DEFAULT 0")
+        if "cache_status" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cache_status TEXT")
+        if "cache_buffer_seconds" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cache_buffer_seconds INTEGER")
+        if "cache_duration_seconds" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN cache_duration_seconds REAL DEFAULT 0")
+        if "download_id" not in existing_job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN download_id TEXT")
         existing_video_columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(videos)").fetchall()
@@ -218,6 +244,22 @@ def init_storage() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_sessions (
+                job_id TEXT PRIMARY KEY,
+                playlist_path TEXT NOT NULL,
+                cache_dir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                cached_duration_seconds REAL NOT NULL DEFAULT 0,
+                buffer_seconds INTEGER NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS uploads (
@@ -778,6 +820,31 @@ def get_duration_seconds(path: Path) -> Optional[float]:
         return None
 
 
+def get_remote_duration_seconds(source: str) -> Optional[float]:
+    """Probe a remote URL without retaining its credentials in logs."""
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                source,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=True,
+        )
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except Exception:
+        return None
+
+
 def is_remote_source(value: str) -> bool:
     return value.startswith("https://") or value.startswith("http://")
 
@@ -821,6 +888,191 @@ def get_download(download_id: str) -> Optional[dict]:
 def list_downloads() -> list[dict]:
     rows = db_fetchall("SELECT * FROM downloads ORDER BY created_at DESC LIMIT 50")
     return [download_row_to_dict(row) for row in rows]
+
+
+def playlist_cached_duration(playlist_path: Path) -> float:
+    try:
+        content = playlist_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0.0
+    return sum(float(value) for value in re.findall(r"#EXTINF:([0-9.]+)", content))
+
+
+def update_cache_session(job_id: str, **changes: object) -> None:
+    if not changes:
+        return
+    changes["updated_at"] = utc_now()
+    fields = ", ".join(f"{key} = ?" for key in changes)
+    db_execute(f"UPDATE cache_sessions SET {fields} WHERE job_id = ?", (*changes.values(), job_id))
+
+
+def cache_session_row(job_id: str) -> Optional[sqlite3.Row]:
+    return db_fetchone("SELECT * FROM cache_sessions WHERE job_id = ?", (job_id,))
+
+
+def start_cached_s3_restream(
+    job_id: str,
+    source_url: str,
+    publish_url: str,
+    transport: str,
+    loop: bool,
+    duration: Optional[float],
+    encoding_profile: str,
+    h264_crf: int,
+    h264_preset: str,
+    h264_gop: int,
+    buffer_seconds: int,
+) -> None:
+    cache_dir = BASE_DIR / "cache" / job_id
+    playlist_path = cache_dir / "index.m3u8"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    now = utc_now()
+    db_execute(
+        """
+        INSERT OR REPLACE INTO cache_sessions(
+            job_id, playlist_path, cache_dir, status, cached_duration_seconds,
+            buffer_seconds, created_at, updated_at
+        ) VALUES (?, ?, ?, 'CACHING', 0, ?, ?, ?)
+        """,
+        (job_id, str(playlist_path), str(cache_dir), buffer_seconds, now, now),
+    )
+    db_execute(
+        "UPDATE jobs SET status = ?, cache_local = 1, cache_status = ?, cache_buffer_seconds = ?, cache_duration_seconds = 0 WHERE id = ?",
+        ("BUFFERING", "CACHING", buffer_seconds, job_id),
+    )
+    add_event(job_id, "CACHE_STARTED", f"Creating local cache; restream starts after {buffer_seconds}s is ready")
+    threading.Thread(
+        target=run_cached_s3_restream,
+        args=(
+            job_id, source_url, playlist_path, publish_url, transport, loop, duration,
+            encoding_profile, h264_crf, h264_preset, h264_gop, buffer_seconds,
+        ),
+        daemon=True,
+    ).start()
+
+
+def run_cached_s3_restream(
+    job_id: str,
+    source_url: str,
+    playlist_path: Path,
+    publish_url: str,
+    transport: str,
+    loop: bool,
+    duration: Optional[float],
+    encoding_profile: str,
+    h264_crf: int,
+    h264_preset: str,
+    h264_gop: int,
+    buffer_seconds: int,
+) -> None:
+    cache_dir = playlist_path.parent
+    segment_pattern = cache_dir / "segment_%06d.ts"
+    try:
+        resolved_url = resolve_s3_source(source_url)
+        if duration is None:
+            duration = get_remote_duration_seconds(resolved_url)
+            if duration:
+                db_execute("UPDATE jobs SET duration_seconds = ? WHERE id = ?", (duration, job_id))
+        args = [
+            FFMPEG_BIN, "-hide_banner", "-loglevel", "warning", "-nostdin",
+            "-i", resolved_url,
+            "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "hls", "-hls_time", "6",
+            "-hls_list_size", "0", "-hls_flags", "append_list",
+            "-hls_segment_filename", str(segment_pattern), "-y", str(playlist_path),
+        ]
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        with cache_lock:
+            cache_processes[job_id] = process
+        started_restream = False
+        last_cached = -1.0
+        last_event = 0.0
+        while process.poll() is None and not shutdown_event.is_set():
+            cached_duration = playlist_cached_duration(playlist_path)
+            if cached_duration != last_cached:
+                update_cache_session(job_id, cached_duration_seconds=cached_duration)
+                db_execute(
+                    "UPDATE jobs SET cache_duration_seconds = ? WHERE id = ?",
+                    (cached_duration, job_id),
+                )
+                last_cached = cached_duration
+            if not started_restream and cached_duration >= buffer_seconds:
+                started_restream = True
+                update_cache_session(job_id, status="STREAMING")
+                db_execute("UPDATE jobs SET cache_status = ? WHERE id = ?", ("STREAMING", job_id))
+                add_event(job_id, "CACHE_BUFFER_READY", f"Local cache reached {cached_duration:.0f}s; starting restream")
+                start_ffmpeg_job(
+                    job_id, playlist_path, publish_url, transport, loop, duration,
+                    encoding_profile=encoding_profile, h264_crf=h264_crf,
+                    h264_preset=h264_preset, h264_gop=h264_gop,
+                )
+            if not started_restream and time.monotonic() - last_event >= 30:
+                add_event(job_id, "CACHE_BUFFERING", f"Local cache: {cached_duration:.0f}s / {buffer_seconds}s")
+                last_event = time.monotonic()
+            time.sleep(1)
+
+        stderr = f"Cache segmenter exited with code {process.returncode}"
+        cached_duration = playlist_cached_duration(playlist_path)
+        job = db_fetchone("SELECT status FROM jobs WHERE id = ?", (job_id,))
+        was_stopped = job and job["status"] in {"STOPPED", "STOPPING"}
+        cache_status = "STOPPED" if was_stopped else ("READY" if process.returncode == 0 else "FAILED")
+        update_cache_session(
+            job_id,
+            status=cache_status,
+            cached_duration_seconds=cached_duration,
+            completed_at=utc_now(),
+            error=None if process.returncode == 0 or was_stopped else stderr[-1000:],
+        )
+        db_execute(
+            "UPDATE jobs SET cache_status = ?, cache_duration_seconds = ? WHERE id = ?",
+            (cache_status, cached_duration, job_id),
+        )
+        if not started_restream and not was_stopped:
+            if process.returncode == 0 and cached_duration > 0:
+                add_event(job_id, "CACHE_READY", f"Cache completed with {cached_duration:.0f}s; starting restream")
+                start_ffmpeg_job(
+                    job_id, playlist_path, publish_url, transport, loop, duration,
+                    encoding_profile=encoding_profile, h264_crf=h264_crf,
+                    h264_preset=h264_preset, h264_gop=h264_gop,
+                )
+            else:
+                message = stderr[-1000:] or "Local cache could not reach the configured buffer"
+                db_execute(
+                    "UPDATE jobs SET status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+                    ("FAILED", message, utc_now(), job_id),
+                )
+                add_event(job_id, "CACHE_FAILED", message)
+    except Exception as error:
+        message = str(error)[-1000:]
+        update_cache_session(job_id, status="FAILED", error=message, completed_at=utc_now())
+        db_execute(
+            "UPDATE jobs SET status = ?, cache_status = ?, last_error = ?, ended_at = ? WHERE id = ?",
+            ("FAILED", "FAILED", message, utc_now(), job_id),
+        )
+        add_event(job_id, "CACHE_FAILED", message)
+    finally:
+        with cache_lock:
+            cache_processes.pop(job_id, None)
+
+
+def terminate_cache_process(job_id: str, timeout_seconds: int = 10) -> None:
+    with cache_lock:
+        process = cache_processes.get(job_id)
+    if not process or process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def update_download(download_id: str, **changes: object) -> None:
@@ -1175,6 +1427,12 @@ def read_stderr_logs(
         line = raw_line.strip()
         if not line:
             continue
+        lowered_line = line.lower()
+        if any(marker in lowered_line for marker in INPUT_INTEGRITY_ERROR_MARKERS):
+            with runtime_lock:
+                runtime = runtime_processes.get(job_id)
+                if runtime and runtime.input_integrity_error is None:
+                    runtime.input_integrity_error = line
         parsed = parse_ffmpeg_time(line)
         if parsed is not None:
             current_time = progress_base_seconds + parsed
@@ -1209,6 +1467,10 @@ def monitor_process(
     stdout_thread.join(timeout=2)
     stderr_thread.join(timeout=2)
 
+    with runtime_lock:
+        runtime = runtime_processes.get(job_id)
+        input_integrity_error = runtime.input_integrity_error if runtime else None
+
     row = db_fetchone("SELECT status FROM jobs WHERE id = ?", (job_id,))
     current_status = row["status"] if row else "UNKNOWN"
     if shutdown_event.is_set() and current_status in {"PENDING", "RUNNING"}:
@@ -1222,6 +1484,8 @@ def monitor_process(
         return
     if current_status in {"STOPPED", "STOPPING"}:
         final_status = "STOPPED"
+    elif input_integrity_error:
+        final_status = "FAILED"
     elif exit_code == 0 and not loop:
         final_status = "COMPLETED"
         db_execute("UPDATE jobs SET progress_percent = 100 WHERE id = ?", (job_id,))
@@ -1229,6 +1493,9 @@ def monitor_process(
         final_status = "STOPPED"
     else:
         final_status = "FAILED"
+
+    if input_integrity_error:
+        db_execute("UPDATE jobs SET last_error = ? WHERE id = ?", (input_integrity_error, job_id))
 
     db_execute(
         "UPDATE jobs SET status = ?, exit_code = ?, ended_at = ? WHERE id = ?",
@@ -1238,7 +1505,12 @@ def monitor_process(
     if final_status == "COMPLETED":
         add_event(job_id, "COMPLETED", "Restream completed")
     elif final_status == "FAILED":
-        add_event(job_id, "FAILED", f"FFmpeg exited before completion with exit_code={exit_code}")
+        message = (
+            f"Input ended prematurely: {input_integrity_error}"
+            if input_integrity_error
+            else f"FFmpeg exited before completion with exit_code={exit_code}"
+        )
+        add_event(job_id, "FAILED", message)
     elif final_status == "STOPPED":
         add_event(job_id, "STOPPED", "Restream stopped")
     with runtime_lock:
@@ -1287,6 +1559,10 @@ def start_ffmpeg_job(
     else:
         args.extend(["-c:v", "copy", "-c:a", "copy"])
     args.extend(["-f", "rtsp", "-rtsp_transport", transport, "-progress", "pipe:1", publish_url])
+    with runtime_lock:
+        current = runtime_processes.get(job_id)
+        if current and current.process.poll() is None:
+            raise HTTPException(status_code=409, detail="This restream job already has a running FFmpeg process")
     process = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
@@ -1329,6 +1605,24 @@ def terminate_runtime_process(job_id: str, timeout_seconds: int = 10) -> None:
 
 
 def maybe_auto_retry_job(job_id: str) -> None:
+    """Schedule one retry worker per job, even when several monitors finish together."""
+    with retry_lock:
+        if job_id in retrying_jobs:
+            add_event(job_id, "AUTO_RESUME_SKIPPED", "A retry is already scheduled for this session")
+            return
+        retrying_jobs.add(job_id)
+    threading.Thread(target=_maybe_auto_retry_job, args=(job_id,), daemon=True).start()
+
+
+def _maybe_auto_retry_job(job_id: str) -> None:
+    try:
+        _run_auto_retry_job(job_id)
+    finally:
+        with retry_lock:
+            retrying_jobs.discard(job_id)
+
+
+def _run_auto_retry_job(job_id: str) -> None:
     if shutdown_event.is_set():
         return
     job = db_fetchone("SELECT * FROM jobs WHERE id = ?", (job_id,))
@@ -1413,11 +1707,38 @@ def maybe_auto_retry_job(job_id: str) -> None:
         add_event(job_id, "AUTO_RESUME_FAILED", str(error.detail), offset)
 
 
+def recover_buffering_cache_jobs() -> None:
+    """Restart only jobs that had not published an RTSP stream before shutdown."""
+    rows = db_fetchall(
+        """
+        SELECT * FROM jobs
+        WHERE status = 'BUFFERING' AND cache_local = 1 AND source_url IS NOT NULL
+        ORDER BY created_at ASC
+        """
+    )
+    for job in rows:
+        add_event(job["id"], "CACHE_RECOVERED", "Service restarted; rebuilding local cache buffer")
+        start_cached_s3_restream(
+            job["id"],
+            job["source_url"],
+            job["publish_url"],
+            job["rtsp_transport"] or "tcp",
+            bool(job["loop"]),
+            job["duration_seconds"],
+            job["encoding_profile"] or PROFILE_COPY,
+            int(job["h264_crf"] or DEFAULT_H264_CRF),
+            job["h264_preset"] or DEFAULT_H264_PRESET,
+            int(job["h264_gop"] or DEFAULT_H264_GOP),
+            int(job["cache_buffer_seconds"] or 300),
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     shutdown_event.clear()
     init_storage()
     scan_video_libraries()
+    recover_buffering_cache_jobs()
     resume_active_jobs()
     yield
     shutdown_event.set()
@@ -1428,4 +1749,12 @@ async def lifespan(_: FastAPI):
             runtime.process.terminate()
             add_log(job_id, "SYSTEM", "Process terminated during application shutdown")
         except Exception:
+            pass
+    with cache_lock:
+        caches = list(cache_processes.items())
+    for job_id, process in caches:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            add_log(job_id, "SYSTEM", "Cache process terminated during application shutdown")
+        except ProcessLookupError:
             pass

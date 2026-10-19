@@ -123,6 +123,7 @@ function syncEncodingProfile() {
 function syncS3Source() {
   const enabled = $("useS3Source").checked;
   $("s3SourceField").hidden = !enabled;
+  $("s3CacheConfig").hidden = !enabled;
   $("s3Source").required = enabled;
 }
 
@@ -227,12 +228,22 @@ function jobRow(job) {
   const rtspPath = escapeHtml(job.rtsp_path);
   const status = escapeHtml(job.status);
   const durationSeconds = job.duration_seconds || job.video?.duration_seconds;
+  const download = state.downloads.find((item) => item.id === job.download_id);
+  const downloaded = Number(download?.downloaded_bytes || 0);
+  const downloadTotal = Number(download?.total_bytes || 0);
+  const downloadPercent = downloadTotal > 0 ? Math.min(100, downloaded / downloadTotal * 100) : 0;
+  const cacheBuffer = Number(job.cache_buffer_seconds || 0);
+  const cacheDuration = Number(job.cache_duration_seconds || 0);
+  const cacheInfo = job.cache_local
+    ? `<div class="cache-progress"><span>Download ${download ? `${downloadPercent.toFixed(1)}%` : "queued"}</span><span>Cache ${formatDuration(cacheDuration)} / ${formatDuration(cacheBuffer)}</span></div>`
+    : "";
   tr.innerHTML = `
     <td><span class="status ${status}">${status}</span></td>
     <td>
       <div class="progress"><span style="width:${Math.min(100, Number(job.progress_percent || 0))}%"></span></div>
       ${isLoop ? "Looping" : `${percent}%`}
       <div class="progress-time">${formatDuration(job.out_time_seconds)}${isLoop ? " elapsed" : ` / ${formatDuration(durationSeconds)}`}</div>
+      ${cacheInfo}
     </td>
     <td>
       <div class="camera-name">${cameraLabel}</div>
@@ -296,6 +307,7 @@ async function openJobDetails(jobId) {
     <div><strong>Status</strong><span>${escapeHtml(job.status)}</span></div>
     <div><strong>Video</strong><span>${escapeHtml(video.original_name || "-")}</span></div>
     <div><strong>Source</strong><span>${job.source_type === "s3" ? "S3 / remote URL" : escapeHtml(video.path || "-")}</span></div>
+    <div><strong>Cache</strong><span>${job.cache_local ? `${escapeHtml(job.cache_status || "QUEUED")} | ${formatDuration(job.cache_duration_seconds)} / ${formatDuration(job.cache_buffer_seconds)}` : "not enabled"}</span></div>
     <div><strong>Camera</strong><span>${escapeHtml(job.camera_name || job.camera_code || "-")}</span></div>
     <div><strong>Camera code</strong><span>${escapeHtml(job.rtsp_path)}</span></div>
     <div><strong>Progress</strong><span>${Number(job.progress_percent || 0).toFixed(1)}%</span></div>
@@ -555,6 +567,8 @@ $("jobForm").addEventListener("submit", async (event) => {
   const payload = {
     video_id: useS3Source ? null : state.selectedVideoId,
     s3_source: useS3Source ? $("s3Source").value.trim() : null,
+    cache_local: useS3Source && $("cacheLocal").checked,
+    cache_buffer_seconds: Number($("cacheBufferSeconds").value),
     camera_name: $("cameraName").value || null,
     rtsp_path: $("rtspPath").value,
     username: $("username").value || null,
